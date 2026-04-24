@@ -148,17 +148,15 @@ Download the assets folder and LightningGUI file, and store them in the same pla
 
 #### Building
 
-Interested in building ZapCapture on your system? To build ZapCapture, you need to have Python 3.6 or later. Clone this repository, and use pip to install the requirements.txt file.
+Interested in building ZapCapture on your system? To build ZapCapture, you need to have Python 3.9 or later. Clone this repository, and use `uv` to install the dependencies.
 
-`$ python -m pip install -r requirements.txt`
+`$ uv sync`
 
-Run LightningGUI.py to analyze some lightning!
+Run `$ uv run LightningGUI.py` to analyze some lightning!
 
 If you would like to run from an executable instead of python, use pyinstaller.
 
-`$ cd Downloads/Lightning-Analyzer-GUI `
-
-`$ pyinstaller LightningGUI.py --onefile --icon logo.ico`
+`$ uv run pyinstaller LightningGUI.py --onefile --icon logo.ico`
 
 If you don't want to see debugging info, add `--noconsole` to the pyinstaller command. Now, you will find a folder called `dist` with an executable inside!
 

@@ -16,10 +16,12 @@ import tkinter
 from PIL import Image, ImageTk
 import cv2
 import imageio
+from collections import deque
+import numpy as np
 
 # imports for gui interface
-from PySide2.QtCore import Qt, QObject, QThread, Signal, Slot
-from PySide2.QtWidgets import (
+from PySide6.QtCore import Qt, QObject, QThread, Signal, Slot
+from PySide6.QtWidgets import (
     QApplication,
     QLabel,
     QMainWindow,
@@ -30,9 +32,10 @@ from PySide2.QtWidgets import (
     QFileDialog,
     QLineEdit,
     QProgressBar,
-    QMessageBox
+    QMessageBox,
+    QCheckBox
 )
-from PySide2.QtGui import (
+from PySide6.QtGui import (
     QPalette,
     QColor,
     QIntValidator,
@@ -58,6 +61,10 @@ threshold = '5000000'
 # buttonstate determines output file name type.
 global buttonState
 buttonState = True
+global buffer_frames
+buffer_frames = '5'
+global mask_rect
+mask_rect = None
 
 
 def count_diff(img1, img2):
@@ -66,6 +73,21 @@ def count_diff(img1, img2):
     small2 = cv2.resize(img2, (0, 0), fx=SCALE, fy=SCALE)
     diff = cv2.absdiff(small1, small2)
     diff = cv2.cvtColor(diff, cv2.COLOR_RGB2GRAY)
+    
+    global mask_rect
+    if mask_rect is not None:
+        x, y, w, h = mask_rect
+        # Scale mask to match the resized frame
+        sx, sy, sw, sh = int(x * SCALE), int(y * SCALE), int(w * SCALE), int(h * SCALE)
+        h_img, w_img = diff.shape[:2]
+        sx = max(0, min(sx, w_img))
+        sy = max(0, min(sy, h_img))
+        sw = max(0, min(sw, w_img - sx))
+        sh = max(0, min(sh, h_img - sy))
+        if sw > 0 and sh > 0:
+            # Black out the ignored region so it doesn't trigger differences
+            diff[sy:sy+sh, sx:sx+sw] = 0
+            
     frame_delta1 = cv2.threshold(diff, NOISE_CUTOFF, 255, 3)[1]
     frame_delta1_color = cv2.cvtColor(frame_delta1, cv2.COLOR_GRAY2RGB)
     delta_count1 = cv2.countNonZero(frame_delta1)
@@ -83,7 +105,7 @@ def error_popup(message):
     msg.setWindowTitle("Lightning Analysis Error")
     # prevents crash after closing message box
     msg.setAttribute(Qt.WA_DeleteOnClose)
-    msg.exec_()
+    msg.exec()
 
 # Popup for info after analysis. Caused crashes when started from
 # the analysis thread rather than the main thread.
@@ -119,9 +141,11 @@ class Worker(QObject):
         global output_folder
         global threshold
         global buttonState
+        global buffer_frames
         in_folder = input_folder
         out_folder = output_folder
         threshold_integer = int(threshold)
+        buffer_frames_integer = int(buffer_frames)
         # set framecount, strike counter to zero before looping all frames
         frame_count = 0
         strikes = 0
@@ -204,6 +228,7 @@ class Worker(QObject):
             print("setting codec mp4v")
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
             print("codec successful!")
+            
             # savestate for using the deadzone.
             deadzone = 0
             # creates list for gif frames
@@ -211,6 +236,7 @@ class Worker(QObject):
             gif_name = ''
             # strike counter independent for file. Helps with writing gifs.
             file_strikes = 0
+            frame_buffer = deque(maxlen=buffer_frames_integer) if buffer_frames_integer > 0 else deque()
             # remove filename period, so that the output files don't confuse anything.
             filename = filename.replace('.', '_')
             for i in range(nframes-1):
@@ -221,6 +247,8 @@ class Worker(QObject):
                 self.threadProgress.emit(file_completion)
                 # process the video
                 flag, frame1 = video.read()
+                if not flag: break
+                
                 diff1 = count_diff(frame0, frame1)
                 # checks for file output name system
                 # names files and gifs respectively.
@@ -235,7 +263,9 @@ class Worker(QObject):
                     # end a gif if the clip gets large to prevent computer issues.
                     # massive gifs can cause lag and other problems.
                     deadzone = 0
-                if diff1 > threshold_integer:
+                
+                is_strike = diff1 > threshold_integer
+                if is_strike:
                     # pass condition to save a frame and start a save state
                     strikes = strikes + 1
                     file_strikes = file_strikes + 1
@@ -244,35 +274,37 @@ class Worker(QObject):
                     # and the deadzone is already zero (ie lightning has already
                     # struck and the gif buffer contains frames).
                     if deadzone == 0 and file_strikes > 1:
-                        gif_start_frame = gif_frames[0]
-                        gif_frames.pop(0)
-                        print('setting writer')
-                        out = cv2.VideoWriter(gif_name, fourcc, 4.0, (width,height))
-                        for idx, frame in enumerate(gif_frames):
-                            print('writing frame')
-                            out.write(frame)
-                            print('wrote frame')
-                        out.release()
-                        gif_frames = []
-                    # deadzone must be an int > 0 to save an image.
-                    deadzone = 3
+                        if len(gif_frames) > 0:
+                            gif_start_frame = gif_frames[0]
+                            gif_frames.pop(0)
+                            print('setting writer')
+                            out = cv2.VideoWriter(gif_name, fourcc, 4.0, (width,height))
+                            for idx, frame in enumerate(gif_frames):
+                                print('writing frame')
+                                out.write(frame)
+                                print('wrote frame')
+                            out.release()
+                            gif_frames = []
+                    
+                    # Process any buffered 'before' frames
+                    while len(frame_buffer) > 0:
+                        buf_frame, buf_i, buf_imname = frame_buffer.popleft()
+                        cv2.imwrite(buf_imname, buf_frame)
+                        gif_frames.append(buf_frame)
+                        
+                    deadzone = buffer_frames_integer
                     gif_name = gifname
-
-                if diff1 < threshold_integer*END_STRIKE_PERCENTAGE:
-                    # itterates deadzone to zero, leaving deadzone condition.
-                    # if the diff is less than the end strike percentage, the
-                    # deadzone is reduced by 1. Deadzone of 0 will result
-                    # in not saving the frame.
-                    #end strike percentage set in the initial constants.
-                    #still need to find the sweet spot between 1% and 30%.
-                    if deadzone > 0:
-                        deadzone = deadzone - 1
 
                 if deadzone > 0:
                     # save frame for passing the deadzone condition.
                     cv2.imwrite(imname, frame1)
                     # save frame to list for writing to gif
                     gif_frames.append(frame1)
+                    deadzone -= 1
+                else:
+                    # Not currently saving a strike, buffer frames for next potential strike
+                    if buffer_frames_integer > 0:
+                        frame_buffer.append((frame1, i, imname))
 
                 text = str(f_out)+', '+str(diff1)
                 # write threshold data to csv
@@ -280,7 +312,7 @@ class Worker(QObject):
                 fff.flush()
                 # pass frame forward
                 frame0 = frame1
-                if i == nframes-1 and not gif_frames[0]:
+                if i == nframes-1 and len(gif_frames) > 0:
                     # saves a gif at the end of a file
                     gif_start_frame = gif_frames[0]
                     gif_frames.pop(0)
@@ -332,6 +364,16 @@ class Window(QMainWindow):
         self.outputFileDirectoryButton.clicked.connect(self.pick_new_output)
         self.outputFileDirectoryLabel = QLabel(output_folder)
         self.outputFileDirectoryLabel.setAlignment(Qt.AlignHCenter | Qt.AlignVCenter)
+        
+        # mask widget
+        self.setMaskButton = QPushButton("Select Area to Ignore (Mask)", self)
+        self.setMaskButton.clicked.connect(self.define_mask)
+        self.setMaskButton.setToolTip("Draw a box over an area of the video to ignore during analysis (e.g., ground or moving trees).")
+        
+        self.clearMaskButton = QPushButton("Clear Mask", self)
+        self.clearMaskButton.clicked.connect(self.clear_mask)
+        self.clearMaskButton.setToolTip("Clear the currently selected mask.")
+        
         # file name widgets
         self.outputFilenameLabel = QLabel('Output File Name (❓)')
         self.outputFilenameLabel.setAlignment(Qt.AlignHCenter | Qt.AlignVCenter)
@@ -344,6 +386,12 @@ class Window(QMainWindow):
         self.outputTimestampButton.setChecked(False)
         self.outputTimestampButton.toggled.connect(
             lambda: self.btnstate(self.outputTimestampButton))
+        
+        # calculate threshold widget
+        self.calcThresholdButton = QPushButton("Calculate Suggested Threshold", self)
+        self.calcThresholdButton.clicked.connect(self.calculate_suggested_threshold)
+        self.calcThresholdButton.setToolTip("Skims the first video to automatically calculate and fill in a suggested threshold.")
+        
         # threshold widget
         self.thresholdLabel = QLabel("Threshold (❓)", self)
         self.thresholdLabel.setAlignment(Qt.AlignHCenter | Qt.AlignVCenter)
@@ -352,6 +400,18 @@ class Window(QMainWindow):
         # restricts the threshold to be numbers only
         self.onlyInt = QIntValidator()
         self.thresholdEntry.setValidator(self.onlyInt)
+        
+        # buffer frames widget
+        self.bufferFramesLabel = QLabel("Buffer Frames Before & After (❓)", self)
+        self.bufferFramesLabel.setAlignment(Qt.AlignHCenter | Qt.AlignVCenter)
+        self.bufferFramesLabel.setToolTip("Number of frames to save immediately before and after the detected strike.")
+        self.bufferFramesEntry = QLineEdit(buffer_frames)
+        self.bufferFramesEntry.setValidator(self.onlyInt)
+        
+        self.previewButton = QPushButton('Live Preview Settings', self)
+        self.previewButton.setToolTip('Play a clip from the input folder to see if your threshold and mask settings are detecting strikes correctly.')
+        self.previewButton.clicked.connect(self.preview_settings)
+        
         self.analysisButton = QPushButton('Perform Analysis', self)
         # self.analysisButton.clicked.connect(self.analysis)
         self.analysisButton.clicked.connect(self.runLongTask)
@@ -371,11 +431,17 @@ class Window(QMainWindow):
         layout.addWidget(self.inputFileDirectoryLabel)
         layout.addWidget(self.outputFileDirectoryButton)
         layout.addWidget(self.outputFileDirectoryLabel)
+        layout.addWidget(self.setMaskButton)
+        layout.addWidget(self.clearMaskButton)
         layout.addWidget(self.outputFilenameLabel)
         layout.addWidget(self.outputFrameNumButton)
         layout.addWidget(self.outputTimestampButton)
+        layout.addWidget(self.calcThresholdButton)
         layout.addWidget(self.thresholdLabel)
         layout.addWidget(self.thresholdEntry)
+        layout.addWidget(self.bufferFramesLabel)
+        layout.addWidget(self.bufferFramesEntry)
+        layout.addWidget(self.previewButton)
         layout.addWidget(self.analysisButton)
         layout.addWidget(self.progressBar)
         layout.addWidget(self.starvationButton)
@@ -410,11 +476,202 @@ class Window(QMainWindow):
             else:
                 buttonState = False
                 print(b.text()+" is deselected")
+                
+    def define_mask(self):
+        global input_folder
+        global mask_rect
+        if input_folder == 'No Folder Chosen' or not os.path.isdir(input_folder):
+            error_popup("Please select a valid input folder first.")
+            return
+
+        # Find first video
+        first_video = None
+        for f in os.listdir(input_folder):
+            if f.lower().endswith(('.mp4', '.avi', '.mov', '.mkv', '.wmv')):
+                first_video = os.path.join(input_folder, f)
+                break
+
+        if not first_video:
+            error_popup("No video files found in the selected input folder.")
+            return
+
+        cap = cv2.VideoCapture(first_video)
+        ret, frame = cap.read()
+        cap.release()
+
+        if not ret:
+            error_popup("Could not read the first video to define a mask.")
+            return
+
+        # Scale down for display if the video is huge
+        h, w = frame.shape[:2]
+        max_height = 800
+        if h > max_height:
+            scale_display = max_height / h
+            display_frame = cv2.resize(frame, (int(w * scale_display), max_height))
+        else:
+            scale_display = 1.0
+            display_frame = frame
+
+        window_name = "Draw Box over Area to IGNORE (Press Space to confirm)"
+        roi = cv2.selectROI(window_name, display_frame, showCrosshair=True, fromCenter=False)
+        cv2.destroyWindow(window_name)
+        cv2.waitKey(1)  # Important for macOS to flush the close event immediately
+
+        if roi[2] > 0 and roi[3] > 0:
+            real_x = int(roi[0] / scale_display)
+            real_y = int(roi[1] / scale_display)
+            real_w = int(roi[2] / scale_display)
+            real_h = int(roi[3] / scale_display)
+            
+            mask_rect = (real_x, real_y, real_w, real_h)
+            print(f"Mask defined: {mask_rect}")
+            self.setMaskButton.setText("Area to Ignore: Custom Mask Applied")
+        else:
+            mask_rect = None
+            print("Mask cancelled. Using full frame.")
+            self.setMaskButton.setText("Select Area to Ignore (Mask)")
+            
+    def clear_mask(self):
+        global mask_rect
+        mask_rect = None
+        print("Mask cleared.")
+        self.setMaskButton.setText("Select Area to Ignore (Mask)")
+                
+    def calculate_suggested_threshold(self):
+        global input_folder
+        if input_folder == 'No Folder Chosen' or not os.path.isdir(input_folder):
+            error_popup("Please select a valid input folder first.")
+            return
+
+        first_video = None
+        for f in os.listdir(input_folder):
+            if f.lower().endswith(('.mp4', '.avi', '.mov', '.mkv', '.wmv')):
+                first_video = os.path.join(input_folder, f)
+                break
+
+        if not first_video:
+            error_popup("No video files found in the selected input folder.")
+            return
+
+        self.calcThresholdButton.setText("Calculating... Please wait")
+        self.calcThresholdButton.setEnabled(False)
+        QApplication.processEvents()  # Keeps GUI responsive
+
+        cap = cv2.VideoCapture(first_video)
+        ret, frame0 = cap.read()
+        if not ret:
+            error_popup("Could not read the first video.")
+            cap.release()
+            self.calcThresholdButton.setText("Calculate Suggested Threshold")
+            self.calcThresholdButton.setEnabled(True)
+            return
+
+        diffs = []
+        # Read a healthy sample of frames (~50 seconds) to find the noise baseline
+        for i in range(1500):
+            ret, frame1 = cap.read()
+            if not ret: break
+            diffs.append(count_diff(frame0, frame1))
+            frame0 = frame1
+            if i % 50 == 0: QApplication.processEvents()
+        cap.release()
+
+        if diffs:
+            diffs_arr = np.array(diffs)
+            suggested = int(np.mean(diffs_arr) + 5 * np.std(diffs_arr))
+            suggested = max(suggested, 1000)
+            self.thresholdEntry.setText(str(suggested))
+            print(f"Suggested threshold calculated: {suggested}")
+        
+        self.calcThresholdButton.setText("Calculate Suggested Threshold")
+        self.calcThresholdButton.setEnabled(True)
+            
+    def preview_settings(self):
+        global input_folder
+        global mask_rect
+        if input_folder == 'No Folder Chosen' or not os.path.isdir(input_folder):
+            error_popup("Please select a valid input folder first.")
+            return
+
+        # Find first video
+        first_video = None
+        for f in os.listdir(input_folder):
+            if f.lower().endswith(('.mp4', '.avi', '.mov', '.mkv', '.wmv')):
+                first_video = os.path.join(input_folder, f)
+                break
+
+        if not first_video:
+            error_popup("No video files found in the selected input folder.")
+            return
+
+        try:
+            threshold_val = int(self.thresholdEntry.text())
+        except ValueError:
+            threshold_val = 5000000
+
+        cap = cv2.VideoCapture(first_video)
+        ret, frame0 = cap.read()
+        if not ret:
+            error_popup("Could not read the first video for preview.")
+            cap.release()
+            return
+
+        h, w = frame0.shape[:2]
+        window_name = "Preview (Press 'q' or 'ESC' to exit)"
+        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(window_name, min(w, 1280), min(h, 720))
+
+        while True:
+            ret, frame1 = cap.read()
+            if not ret:
+                break  # End of video
+
+            # calculate diff
+            diff1 = count_diff(frame0, frame1)
+            
+            current_threshold = threshold_val
+            is_strike = diff1 > threshold_val
+
+            display_frame = frame1.copy()
+
+            # Draw mask
+            if mask_rect is not None:
+                rx, ry, rw, rh = mask_rect
+                cv2.rectangle(display_frame, (rx, ry), (rx+rw, ry+rh), (0, 0, 255), 2)
+                cv2.putText(display_frame, "IGNORED (MASK)", (rx, ry - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
+            # Draw info
+            info_text = f"Diff: {diff1} | Thresh: {int(current_threshold)}"
+            cv2.putText(display_frame, info_text, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+
+            if is_strike:
+                cv2.putText(display_frame, "STRIKE DETECTED!", (20, 90), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 3)
+
+            cv2.imshow(window_name, display_frame)
+            frame0 = frame1
+
+            key = cv2.waitKey(30) & 0xFF
+            if key == ord('q') or key == 27: # q or ESC
+                break
+
+            # check if window was closed via the "X" button
+            try:
+                if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
+                    break
+            except:
+                pass
+
+        cap.release()
+        cv2.destroyWindow(window_name)
+        cv2.waitKey(1)
 
     def runLongTask(self):
         # set the threshold
         global threshold
+        global buffer_frames
         threshold = self.thresholdEntry.text()
+        buffer_frames = self.bufferFramesEntry.text()
         # Step 2: Create a QThread object
         self.thread = QThread()
         # Step 3: Create a worker object
@@ -472,4 +729,4 @@ app.setPalette(palette)
 # finish building window
 win = Window()
 win.show()
-sys.exit(app.exec_())
+sys.exit(app.exec())
