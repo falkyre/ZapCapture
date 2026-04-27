@@ -8,8 +8,8 @@ from PySide6.QtCore import Qt, QTimer, QThread, Signal
 from PySide6.QtGui import QImage, QPixmap, QMovie
 from PySide6.QtWidgets import (QApplication, QMainWindow, QLabel, QVBoxLayout, 
                                QWidget, QPushButton, QLineEdit, QHBoxLayout, QFileDialog,
-                               QTabWidget, QScrollArea, QGridLayout, QCheckBox, QComboBox, QMessageBox, QProgressBar, QRadioButton, QButtonGroup)
-from core import ZapCore
+                               QTabWidget, QScrollArea, QGridLayout, QCheckBox, QComboBox, QMessageBox, QProgressBar, QRadioButton, QButtonGroup, QDoubleSpinBox, QTextBrowser)
+from core import ZapCore, get_available_fonts
 
 class HoverImageLabel(QLabel):
     def __init__(self, static_pixmap, gif_path, parent=None):
@@ -233,6 +233,34 @@ class MainWindow(QMainWindow):
         self.watermark_input.setPlaceholderText("Enter watermark text...")
         self.watermark_input.textChanged.connect(self.update_watermark)
         
+        self.font_preview_label = QLabel()
+        self.font_preview_label.setFixedHeight(60)
+        self.font_preview_label.setAlignment(Qt.AlignCenter)
+        self.font_preview_label.setStyleSheet("background-color: #222; border: 1px solid #555;")
+        
+        self.watermark_font_combo = QComboBox()
+        available_fonts = get_available_fonts()
+        for font_file, font_name in available_fonts.items():
+            self.watermark_font_combo.addItem(font_name, font_file)
+            
+        default_index = self.watermark_font_combo.findData(self.engine.watermark_font)
+        if default_index >= 0:
+            self.watermark_font_combo.setCurrentIndex(default_index)
+            
+        self.watermark_font_combo.currentIndexChanged.connect(self.update_watermark_font)
+        
+        self.watermark_size_spin = QDoubleSpinBox()
+        self.watermark_size_spin.setRange(0.1, 5.0)
+        self.watermark_size_spin.setSingleStep(0.1)
+        self.watermark_size_spin.setValue(1.0)
+        self.watermark_size_spin.valueChanged.connect(self.update_watermark_size)
+        
+        self.watermark_layout = QHBoxLayout()
+        self.watermark_layout.addWidget(QLabel("Font:"))
+        self.watermark_layout.addWidget(self.watermark_font_combo)
+        self.watermark_layout.addWidget(QLabel("Size:"))
+        self.watermark_layout.addWidget(self.watermark_size_spin)
+        
         self.thresh_input = QLineEdit(str(self.engine.threshold))
         self.thresh_input.textChanged.connect(self.update_thresh)
         
@@ -277,7 +305,9 @@ class MainWindow(QMainWindow):
         controls_layout.addWidget(self.thresh_input)
         controls_layout.addWidget(self.btn_preview)
         controls_layout.addWidget(self.watermark_label)
+        controls_layout.addWidget(self.font_preview_label)
         controls_layout.addWidget(self.watermark_input)
+        controls_layout.addLayout(self.watermark_layout)
         controls_layout.addWidget(self.btn_analyze)
         controls_layout.addWidget(self.progress_bar)
         controls_layout.addStretch()
@@ -297,6 +327,19 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.preview_widget, "Live Preview")
         self.tabs.addTab(self.gallery_tab, "Analysis Results")
         
+        self.help_tab = QWidget()
+        help_layout = QVBoxLayout(self.help_tab)
+        self.help_browser = QTextBrowser()
+        self.help_browser.setOpenExternalLinks(True)
+        guide_path = os.path.join(os.path.dirname(__file__), 'assets', 'USER_GUIDE.md')
+        if os.path.exists(guide_path):
+            with open(guide_path, 'r', encoding='utf-8') as f:
+                self.help_browser.setMarkdown(f.read())
+        else:
+            self.help_browser.setMarkdown("# Help Guide\n\nUser guide not found.")
+        help_layout.addWidget(self.help_browser)
+        self.tabs.addTab(self.help_tab, "Help & Guide")
+        
         main_layout.addLayout(controls_layout, 1)
         main_layout.addWidget(self.tabs, 2)
         
@@ -311,6 +354,8 @@ class MainWindow(QMainWindow):
         self.progress_timer = QTimer()
         self.progress_timer.timeout.connect(self.update_progress)
         
+        self.update_font_preview()
+        
     def select_input(self):
         self.input_dir = QFileDialog.getExistingDirectory(self, "Select Input")
         self.lbl_in_dir.setText(self.input_dir)
@@ -321,6 +366,22 @@ class MainWindow(QMainWindow):
 
     def update_watermark(self, text):
         self.engine.watermark_text = text
+        self.update_font_preview()
+
+    def update_watermark_font(self):
+        self.engine.watermark_font = self.watermark_font_combo.currentData()
+        self.update_font_preview()
+        
+    def update_watermark_size(self, val):
+        self.engine.watermark_size = float(val)
+        self.update_font_preview()
+        
+    def update_font_preview(self):
+        frame = self.engine.generate_font_preview()
+        h, w, ch = frame.shape
+        bytes_per_line = ch * w
+        qimg = QImage(frame.data, w, h, bytes_per_line, QImage.Format_RGB888).rgbSwapped()
+        self.font_preview_label.setPixmap(QPixmap.fromImage(qimg))
 
     def update_output_format(self):
         if self.outputTimestampButton.isChecked():

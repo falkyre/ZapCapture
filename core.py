@@ -4,6 +4,17 @@ import imageio
 import shutil
 from collections import deque
 import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+
+def get_available_fonts():
+    fonts_dir = os.path.join(os.path.dirname(__file__), 'assets', 'fonts')
+    if not os.path.exists(fonts_dir):
+        return {'Arial.ttf': 'Arial'}
+    fonts = {}
+    for f in sorted(os.listdir(fonts_dir)):
+        if f.lower().endswith(('.ttf', '.otf')):
+            fonts[f] = os.path.splitext(f)[0]
+    return fonts if fonts else {'Arial.ttf': 'Arial'}
 
 class ZapCore:
     def __init__(self):
@@ -16,6 +27,8 @@ class ZapCore:
         self.output_format = 'frame'
         self.mask_rect = None
         self.watermark_text = ""
+        self.watermark_font = "Arial.ttf"
+        self.watermark_size = 1.0
         
         # State
         self.progress = 0.0
@@ -35,20 +48,66 @@ class ZapCore:
         if not self.watermark_text:
             return frame
             
-        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_filename = self.watermark_font
+        font_path = os.path.join(os.path.dirname(__file__), 'assets', 'fonts', font_filename)
+        
         h, w = frame.shape[:2]
-        font_scale = max(1.0, h / 500.0)
-        thickness = max(2, int(font_scale * 2))
+        font_size = int(max(10, h / 20) * self.watermark_size)
         
-        text_size = cv2.getTextSize(self.watermark_text, font, font_scale, thickness)[0]
-        text_x = int(w - text_size[0] - 20)
-        text_y = int(h - 20)
+        try:
+            font = ImageFont.truetype(font_path, font_size)
+        except IOError:
+            font = ImageFont.load_default()
+            
+        img_pil = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        draw = ImageDraw.Draw(img_pil)
         
-        # Draw a black drop shadow first, then the white text over it
-        cv2.putText(frame, self.watermark_text, (text_x + 2, text_y + 2), font, font_scale, (0, 0, 0), thickness + 1)
-        cv2.putText(frame, self.watermark_text, (text_x, text_y), font, font_scale, (255, 255, 255), thickness)
+        bbox = draw.textbbox((0, 0), self.watermark_text, font=font)
+        text_w = bbox[2] - bbox[0]
+        text_h = bbox[3] - bbox[1]
         
-        return frame
+        text_x = w - text_w - 20
+        text_y = h - text_h - 20
+        
+        shadow_offset = max(2, int(font_size / 20))
+        draw.text((text_x + shadow_offset, text_y + shadow_offset), self.watermark_text, font=font, fill=(0, 0, 0))
+        draw.text((text_x, text_y), self.watermark_text, font=font, fill=(255, 255, 255))
+        
+        return cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
+
+    def generate_font_preview(self):
+        """Generates a small image showing what the current watermark configuration looks like."""
+        h, w = 100, 400
+        canvas = np.zeros((h, w, 3), dtype=np.uint8)
+        canvas[:] = (40, 40, 40)
+        
+        text = self.watermark_text if self.watermark_text else "Preview ©"
+        
+        font_filename = self.watermark_font
+        font_path = os.path.join(os.path.dirname(__file__), 'assets', 'fonts', font_filename)
+        
+        font_size = int(30 * self.watermark_size)
+        
+        try:
+            font = ImageFont.truetype(font_path, font_size)
+        except IOError:
+            font = ImageFont.load_default()
+            
+        img_pil = Image.fromarray(cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB))
+        draw = ImageDraw.Draw(img_pil)
+        
+        bbox = draw.textbbox((0, 0), text, font=font)
+        text_w = bbox[2] - bbox[0]
+        text_h = bbox[3] - bbox[1]
+        
+        text_x = int((w - text_w) / 2)
+        text_y = int((h - text_h) / 2)
+        
+        shadow_offset = max(1, int(font_size / 20))
+        draw.text((text_x + shadow_offset, text_y + shadow_offset), text, font=font, fill=(0, 0, 0))
+        draw.text((text_x, text_y), text, font=font, fill=(255, 255, 255))
+        
+        return cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
 
     def _count_diff(self, img1, img2):
         small1 = cv2.resize(img1, (0, 0), fx=self.scale, fy=self.scale)

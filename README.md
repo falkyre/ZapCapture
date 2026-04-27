@@ -7,9 +7,9 @@ This project uses a Model-View-Controller (MVC) architecture to run the exact sa
 This project was built upon the orginal ZapCapture code base and significantly improved. The original codebase can be found here: https://github.com/blablabliam/ZapCapture
 
 ## Features
-* **Multi-Algorithm Detection:** Choose between Standard (intensity difference) or Canny Edge Density algorithms.
+* **Multi-Algorithm Detection:** Choose between Standard (intensity difference), Canny Edge Density, and Hybrid (Intensity plus Edge Count) algorithms)
 * **Live Video Preview:** Test your threshold and mask settings in real-time before processing large batches of video.
-* **Interactive Masking:** Draw a rectangle directly on the live preview to ignore moving trees, cars, or ground elements.
+* **Interactive Masking:** Draw a rectangle directly on the live preview to ignore moving trees, cars, or ground elements.  This is typically used to mask out the bottom portions of a landscape.
 * **Custom Watermarking:** Burn custom text with a drop shadow into your final images and GIFs.
 * **Automated GIF Generation:** Automatically buffers frames before and after a strike to generate a seamless animated GIF.
 
