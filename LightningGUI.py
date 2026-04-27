@@ -185,6 +185,7 @@ class HoverImageLabel(QLabel):
         
         if os.path.exists(self.gif_path):
             self.movie = QMovie(self.gif_path)
+            self.movie.setParent(self)
             self.movie.setScaledSize(self.static_pixmap.size())
         else:
             self.movie = None
@@ -192,6 +193,7 @@ class HoverImageLabel(QLabel):
     def enterEvent(self, event):
         if self.movie is not None:
             self.setMovie(self.movie)
+            self.movie.jumpToFrame(0)
             self.movie.start()
         super().enterEvent(event)
 
@@ -417,6 +419,7 @@ class Worker(QObject):
                 
             deadzone = 0
             gif_frames = []
+            gif_png_names = []
             gif_name = ''
             file_strikes = 0
             frame_buffer = deque(maxlen=buffer_frames_integer) if buffer_frames_integer > 0 else deque()
@@ -450,18 +453,27 @@ class Worker(QObject):
                     if deadzone == 0 and file_strikes > 1:
                         if len(gif_frames) > 0:
                             gif_frames.pop(0)
+                            if len(gif_png_names) > 0:
+                                gif_png_names.pop(0)
                             rgb_frames = [cv2.cvtColor(f, cv2.COLOR_BGR2RGB) for f in gif_frames]
                             if len(rgb_frames) > 0:
                                 try:
                                     imageio.mimsave(gif_name, rgb_frames, fps=10, loop=0)
+                                    import shutil
+                                    for png_path in gif_png_names:
+                                        target_gif = os.path.join(gifpath, os.path.basename(png_path).replace('.png', '.gif'))
+                                        if target_gif != gif_name and not os.path.exists(target_gif):
+                                            shutil.copy2(gif_name, target_gif)
                                 except Exception as e:
                                     print(f"Error saving GIF {gif_name}: {e}")
                             gif_frames = []
+                            gif_png_names = []
                             
                     while len(frame_buffer) > 0:
                         buf_frame, buf_i, buf_imname = frame_buffer.popleft()
                         cv2.imwrite(buf_imname, buf_frame)
                         gif_frames.append(buf_frame)
+                        gif_png_names.append(buf_imname)
                         
                     deadzone = buffer_frames_integer
                     gif_name = gifname
@@ -469,6 +481,7 @@ class Worker(QObject):
                 if deadzone > 0:
                     cv2.imwrite(imname, frame1)
                     gif_frames.append(frame1)
+                    gif_png_names.append(imname)
                     deadzone -= 1
                 else:
                     if buffer_frames_integer > 0:
@@ -479,9 +492,20 @@ class Worker(QObject):
                 
                 if i == nframes - 2 and len(gif_frames) > 0:
                     gif_frames.pop(0)
+                    if len(gif_png_names) > 0:
+                        gif_png_names.pop(0)
                     rgb_frames = [cv2.cvtColor(f, cv2.COLOR_BGR2RGB) for f in gif_frames]
-                    imageio.mimsave(gif_name, rgb_frames, fps=10, loop=0)
+                    try:
+                        imageio.mimsave(gif_name, rgb_frames, fps=10, loop=0)
+                        import shutil
+                        for png_path in gif_png_names:
+                            target_gif = os.path.join(gifpath, os.path.basename(png_path).replace('.png', '.gif'))
+                            if target_gif != gif_name and not os.path.exists(target_gif):
+                                shutil.copy2(gif_name, target_gif)
+                    except Exception as e:
+                        print(f"Error saving GIF {gif_name}: {e}")
                     gif_frames = []
+                    gif_png_names = []
                     deadzone = 0
                     
             fff.close()
