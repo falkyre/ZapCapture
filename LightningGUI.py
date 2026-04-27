@@ -168,13 +168,6 @@ def error_popup(message):
 #     msg.setAttribute(Qt.WA_DeleteOnClose)
 #     msg.exec_()
 
-class HyperlinkLable(QLabel):
-    def __init__(self, parent=None):
-        super().__init__()
-        #self.setStyleSheet('font-size: 35px')
-        self.setOpenExternalLinks(True)
-        self.setParent(parent)
-
 class HoverImageLabel(QLabel):
     def __init__(self, static_pixmap, gif_path, parent=None):
         super().__init__(parent)
@@ -695,10 +688,7 @@ class Window(QMainWindow):
         self.progressBar.setAlignment(Qt.AlignHCenter | Qt.AlignVCenter)
         self.progressBar.setValue(0)
         
-        linkTemplate = '<a href={0}>{1}</a>'
-        self.starvationButton = HyperlinkLable(self)
-        starvationMessage = '''Like ZapCapture? Consider buying me a coffee!'''
-        self.starvationButton.setText(linkTemplate.format('https://www.buymeacoffee.com/Blablabliam', starvationMessage))
+
 
         self.controls_layout.addWidget(self.inputFileDirectoryButton)
         self.controls_layout.addWidget(self.inputFileDirectoryLabel)
@@ -719,7 +709,7 @@ class Window(QMainWindow):
         self.controls_layout.addWidget(self.previewButton)
         self.controls_layout.addWidget(self.analysisButton)
         self.controls_layout.addWidget(self.progressBar)
-        self.controls_layout.addWidget(self.starvationButton)
+
         self.controls_layout.addStretch()
         
         # Right Panel (Tabs)

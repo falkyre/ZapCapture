@@ -1,1 +1,5 @@
 .DS_Store
+.kilo
+__pycache__
+.venv
+pyproject.toml.ori

@@ -1,27 +1,27 @@
 [project]
-name = "zapcapture"
+name = "zapcapture-ng"
 version = "2.0.0"
-description = "A python program that extracts lightning images/gifs from videos of storms! ⚡"
-authors = [
-    { name = "Liam Plybon", email = "lplybon1@gmail.com" }
-]
+description = "Lightning Strike Detector with Desktop and Web interfaces based on zapcapture"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
+
 dependencies = [
-    "altgraph>=0.17.2",
-    "imageio>=2.19.2",
-    "numpy>=1.22.3",
-    "opencv-python>=4.5.5.64",
-    "pillow>=9.1.0",
-    "pyside6>=6.4.0",
-    "tqdm>=4.64.0"
+    "imageio",
+    "numpy",
 ]
 
 [project.optional-dependencies]
-dev = [
-    "pyinstaller>=5.0",
-    "pyinstaller-hooks-contrib>=2022.3"
+desktop = [
+    "PySide6",
+    "opencv-python",
 ]
 
+web = [
+    "nicegui",
+    "opencv-python-headless",
+]
+
+# This tells uv to just install the dependencies without trying 
+# to build the local files into an installable Python package.
 [tool.uv]
 package = false
