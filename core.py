@@ -25,6 +25,8 @@ class ZapCore:
         self.detection_mode = 'standard'
         self.buffer_frames = 5
         self.output_format = 'frame'
+        self.export_format = 'gif'        # 'gif', 'mp4', or 'both'
+        self.crop_aspect_ratio = 'None'   # 'None', '1:1', '9:16'
         self.mask_rect = None
         self.watermark_text = ""
         self.watermark_font = "Arial.ttf"
@@ -33,6 +35,11 @@ class ZapCore:
         # State
         self.progress = 0.0
         self.is_analyzing = False
+        self.skip_current = False
+        self.cancel_analysis = False
+        self.current_file = ""
+        self.queue_status = {}  # filename -> 'pending'|'processing'|'done'|'skipped'
+        self.png_to_mp4 = {}   # png_path -> mp4_path, for selective save
         self.cap = None
         self.frame0 = None
         self.strike_display_frames = 0
@@ -42,6 +49,26 @@ class ZapCore:
 
     def clear_mask(self):
         self.mask_rect = None
+
+    def _apply_crop(self, frame):
+        """Center-crops the frame to the selected aspect ratio."""
+        if self.crop_aspect_ratio == 'None':
+            return frame
+        h, w = frame.shape[:2]
+        if self.crop_aspect_ratio == '1:1':
+            target_w, target_h = min(h, w), min(h, w)
+        elif self.crop_aspect_ratio == '9:16':
+            # Pillarbox: crop width to match 9:16 portrait ratio
+            target_h = h
+            target_w = int(h * 9 / 16)
+            if target_w > w:
+                target_w = w
+                target_h = int(w * 16 / 9)
+        else:
+            return frame
+        x_start = (w - target_w) // 2
+        y_start = (h - target_h) // 2
+        return frame[y_start:y_start + target_h, x_start:x_start + target_w]
 
     def _apply_watermark(self, frame):
         """Burns a text watermark into the bottom right corner of the frame."""
@@ -166,6 +193,27 @@ class ZapCore:
             self.cap.release()
             self.cap = None
 
+    def get_preview_info(self):
+        """Returns (current_frame, total_frames, fps) for scrubber UI."""
+        if not self.cap:
+            return 0, 0, 30
+        pos = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES))
+        total = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps = self.cap.get(cv2.CAP_PROP_FPS) or 30
+        return pos, total, fps
+
+    def seek_preview(self, frame_num):
+        """Seek the preview capture to a specific frame and return an annotated frame."""
+        if not self.cap:
+            return None
+        self.cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, frame_num))
+        ret, frame1 = self.cap.read()
+        if not ret:
+            return None
+        self.frame0 = frame1
+        self.strike_display_frames = 0  # clear strike banner on seek
+        return self.get_annotated_preview_frame()
+
     def get_annotated_preview_frame(self):
         if not self.cap:
             return None
@@ -205,9 +253,12 @@ class ZapCore:
         return display_frame
 
     def run_analysis(self, input_dir, output_dir):
-        """Heavy background analysis loop."""
+        """Heavy background analysis loop with queue management."""
         self.is_analyzing = True
         self.progress = 0.0
+        self.cancel_analysis = False
+        self.skip_current = False
+        self.png_to_mp4 = {}
 
         if not os.path.exists(input_dir) or not os.path.exists(output_dir):
             self.is_analyzing = False
@@ -219,31 +270,52 @@ class ZapCore:
             return "No video files found."
 
         total_files = len(files)
+        self.queue_status = {f: 'pending' for f in files}
 
         for file_idx, filename in enumerate(files):
+            if self.cancel_analysis:
+                break
+
+            self.skip_current = False
+            self.current_file = filename
+            self.queue_status[filename] = 'processing'
+
             video_path = os.path.join(input_dir, filename)
             video = cv2.VideoCapture(video_path)
             fps = video.get(cv2.CAP_PROP_FPS)
             nframes = int(video.get(cv2.CAP_PROP_FRAME_COUNT))
-            
+            orig_w = int(video.get(cv2.CAP_PROP_FRAME_WIDTH))
+            orig_h = int(video.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
             if nframes == 0:
+                self.queue_status[filename] = 'skipped'
                 continue
 
             ret, prev_frame = video.read()
             if not ret:
+                self.queue_status[filename] = 'skipped'
                 continue
+
+            # Determine output frame dimensions after cropping
+            sample_crop = self._apply_crop(prev_frame)
+            crop_h, crop_w = sample_crop.shape[:2]
 
             frame_buffer = deque(maxlen=self.buffer_frames)
             gif_frames = []
             gif_png_names = []
+            mp4_frames = []   # Collected separately for imageio MP4 export
+            mp4name_to_save = None
             deadzone = 0
             file_strikes = 0
             filename_clean = os.path.splitext(filename)[0]
-            
+
             csv_path = os.path.join(output_dir, f"{filename_clean}.csv")
             csv_file = open(csv_path, 'w')
 
             for i in range(1, nframes):
+                if self.skip_current or self.cancel_analysis:
+                    break
+
                 ret, frame1 = video.read()
                 if not ret:
                     break
@@ -258,36 +330,57 @@ class ZapCore:
                     timestamp = str(round(i / fps, 2)).replace('.', '-')
                     imname = os.path.join(output_dir, f"{filename_clean}_{timestamp}.png")
                     gifname = os.path.join(output_dir, f"{filename_clean}_{timestamp}.gif")
+                    mp4name = os.path.join(output_dir, f"{filename_clean}_{timestamp}.mp4")
                 else:
                     imname = os.path.join(output_dir, f"{filename_clean}_{i:06d}.png")
                     gifname = os.path.join(output_dir, f"{filename_clean}_{i:06d}.gif")
+                    mp4name = os.path.join(output_dir, f"{filename_clean}_{i:06d}.mp4")
 
-                save_frame = self._apply_watermark(frame1.copy())
+                cropped_frame = self._apply_crop(frame1)
+                save_frame = self._apply_watermark(cropped_frame.copy())
 
                 if is_strike:
                     file_strikes += 1
 
                 if deadzone == 0 and file_strikes > 1:
+                    # Finalize previous strike clip
                     if len(gif_frames) > 0:
-                        rgb_frames = [cv2.cvtColor(f, cv2.COLOR_BGR2RGB) for f in gif_frames]
-                        try:
-                            imageio.mimsave(gif_name_to_save, rgb_frames, fps=10, loop=0)
-                            for png_path in gif_png_names:
-                                expected_gif = png_path.replace('.png', '.gif')
-                                if expected_gif != gif_name_to_save:
-                                    shutil.copy2(gif_name_to_save, expected_gif)
-                        except:
-                            pass
+                        if self.export_format in ('gif', 'both'):
+                            rgb_frames = [cv2.cvtColor(f, cv2.COLOR_BGR2RGB) for f in gif_frames]
+                            try:
+                                imageio.mimsave(gif_name_to_save, rgb_frames, fps=10, loop=0)
+                                for png_path in gif_png_names:
+                                    expected_gif = png_path.replace('.png', '.gif')
+                                    if expected_gif != gif_name_to_save:
+                                        shutil.copy2(gif_name_to_save, expected_gif)
+                            except:
+                                pass
+                        if self.export_format in ('mp4', 'both') and mp4frames_to_save and mp4name_to_save:
+                            try:
+                                rgb = [cv2.cvtColor(f, cv2.COLOR_BGR2RGB) for f in mp4frames_to_save]
+                                imageio.mimsave(mp4name_to_save, rgb, fps=10, macro_block_size=1)
+                            except Exception as e:
+                                print(f'[MP4] Mid-stream export error: {e}')
                     gif_frames = []
                     gif_png_names = []
+                    mp4_frames = []
+                    mp4name_to_save = None
                     file_strikes = 0
 
                 if is_strike:
+                    # Initialize MP4 reference FIRST so buffer frames are registered
+                    if self.export_format in ('mp4', 'both'):
+                        mp4name_to_save = mp4name
+                        mp4frames_to_save = mp4_frames  # reference
+
                     while len(frame_buffer) > 0:
                         buf_frame, _, buf_imname = frame_buffer.popleft()
                         cv2.imwrite(buf_imname, buf_frame)
                         gif_frames.append(buf_frame)
                         gif_png_names.append(buf_imname)
+                        if self.export_format in ('mp4', 'both'):
+                            mp4_frames.append(buf_frame)
+                            self.png_to_mp4[buf_imname] = mp4name_to_save
                     deadzone = self.buffer_frames
                     gif_name_to_save = gifname
 
@@ -295,15 +388,37 @@ class ZapCore:
                     cv2.imwrite(imname, save_frame)
                     gif_frames.append(save_frame)
                     gif_png_names.append(imname)
+                    if self.export_format in ('mp4', 'both'):
+                        mp4_frames.append(save_frame)
+                        self.png_to_mp4[imname] = mp4name_to_save
                     deadzone -= 1
                 else:
                     if self.buffer_frames > 0:
                         frame_buffer.append((save_frame, i, imname))
 
                 prev_frame = frame1
+
+            # Finalize any remaining MP4 frames
+            if self.export_format in ('mp4', 'both') and mp4_frames and mp4name_to_save:
+                print(f'[MP4] Writing {len(mp4_frames)} frames to: {mp4name_to_save}')
+                try:
+                    rgb = [cv2.cvtColor(f, cv2.COLOR_BGR2RGB) for f in mp4_frames]
+                    imageio.mimsave(mp4name_to_save, rgb, fps=10, macro_block_size=1)
+                    print(f'[MP4] Write complete: {mp4name_to_save}')
+                except Exception as e:
+                    print(f'[MP4] Export error: {e}')
+            elif self.export_format in ('mp4', 'both'):
+                print(f'[MP4] Skipped finalize — mp4_frames={len(mp4_frames)}, mp4name_to_save={mp4name_to_save}')
+
             csv_file.close()
             video.release()
 
+            if self.skip_current:
+                self.queue_status[filename] = 'skipped'
+            else:
+                self.queue_status[filename] = 'done'
+
         self.progress = 1.0
         self.is_analyzing = False
+        self.current_file = ""
         return "Analysis Complete!"

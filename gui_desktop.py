@@ -8,7 +8,7 @@ from PySide6.QtCore import Qt, QTimer, QThread, Signal
 from PySide6.QtGui import QImage, QPixmap, QMovie
 from PySide6.QtWidgets import (QApplication, QMainWindow, QLabel, QVBoxLayout, 
                                QWidget, QPushButton, QLineEdit, QHBoxLayout, QFileDialog,
-                               QTabWidget, QScrollArea, QGridLayout, QCheckBox, QComboBox, QMessageBox, QProgressBar, QRadioButton, QButtonGroup, QDoubleSpinBox, QTextBrowser)
+                               QTabWidget, QScrollArea, QGridLayout, QCheckBox, QComboBox, QMessageBox, QProgressBar, QRadioButton, QButtonGroup, QDoubleSpinBox, QTextBrowser, QListWidget, QSlider)
 from core import ZapCore, get_available_fonts
 
 class HoverImageLabel(QLabel):
@@ -134,23 +134,29 @@ class PreviewGallery(QWidget):
     def save_selected(self):
         out_frames_dir = os.path.join(self.final_out_dir, "frames")
         out_gifs_dir = os.path.join(self.final_out_dir, "gifs")
+        out_mp4s_dir = os.path.join(self.final_out_dir, "mp4s")
         
-        if not os.path.exists(out_frames_dir):
-            os.makedirs(out_frames_dir)
-        if not os.path.exists(out_gifs_dir):
-            os.makedirs(out_gifs_dir)
+        os.makedirs(out_frames_dir, exist_ok=True)
+        os.makedirs(out_gifs_dir, exist_ok=True)
+        os.makedirs(out_mp4s_dir, exist_ok=True)
+
+        copied_mp4s = set()
             
         for cb, filepath in self.checkboxes:
             if cb.isChecked():
                 filename = os.path.basename(filepath)
-                dest = os.path.join(out_frames_dir, filename)
-                shutil.copy2(filepath, dest)
+                shutil.copy2(filepath, os.path.join(out_frames_dir, filename))
                 
                 gif_filename = filename.replace(".png", ".gif")
                 gif_path = os.path.join(self.temp_dir, gif_filename)
                 if os.path.exists(gif_path):
-                    gif_dest = os.path.join(out_gifs_dir, gif_filename)
-                    shutil.copy2(gif_path, gif_dest)
+                    shutil.copy2(gif_path, os.path.join(out_gifs_dir, gif_filename))
+
+                # Use the engine's png_to_mp4 map for exact match
+                mp4_src = self.engine.png_to_mp4.get(filepath)
+                if mp4_src and os.path.exists(mp4_src) and mp4_src not in copied_mp4s:
+                    shutil.copy2(mp4_src, os.path.join(out_mp4s_dir, os.path.basename(mp4_src)))
+                    copied_mp4s.add(mp4_src)
         
         self.clear_gallery()
 
@@ -195,9 +201,13 @@ class MainWindow(QMainWindow):
         
         self.btn_in = QPushButton("Select Input Dir")
         self.lbl_in_dir = QLabel(self.input_dir)
+        self.lbl_in_dir.setWordWrap(True)
+        self.lbl_in_dir.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         self.btn_in.clicked.connect(self.select_input)
         self.btn_out = QPushButton("Select Output Dir")
         self.lbl_out_dir = QLabel(self.output_dir)
+        self.lbl_out_dir.setWordWrap(True)
+        self.lbl_out_dir.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         self.btn_out.clicked.connect(self.select_output)
         
         self.outputFilenameLabel = QLabel("Output Filenames:")
@@ -279,15 +289,41 @@ class MainWindow(QMainWindow):
                 border: 2px solid #555;
                 background-color: #111;
                 text-align: center;
-                color: #00ff00;
+                color: #ffffff;
                 font-weight: bold;
+                font-size: 11px;
             }
             QProgressBar::chunk {
-                background-color: #00ff00;
+                background-color: #22c55e;
                 width: 15px;
                 margin: 1px;
             }
         """)
+        
+        self.export_format_combo = QComboBox()
+        self.export_format_combo.addItem("GIF only", "gif")
+        self.export_format_combo.addItem("MP4 only", "mp4")
+        self.export_format_combo.addItem("GIF + MP4", "both")
+        self.export_format_combo.currentIndexChanged.connect(
+            lambda: setattr(self.engine, 'export_format', self.export_format_combo.currentData()))
+
+        self.crop_ratio_combo = QComboBox()
+        self.crop_ratio_combo.addItem("Original", "None")
+        self.crop_ratio_combo.addItem("Square (1:1)", "1:1")
+        self.crop_ratio_combo.addItem("Portrait (9:16)", "9:16")
+        self.crop_ratio_combo.currentIndexChanged.connect(
+            lambda: setattr(self.engine, 'crop_aspect_ratio', self.crop_ratio_combo.currentData()))
+
+        self.queue_list_widget = QListWidget()
+        self.queue_list_widget.setFixedHeight(120)
+        self.queue_list_widget.setStyleSheet("background-color: #111; color: #ccc; font-size: 11px;")
+
+        self.btn_skip = QPushButton("⏭ Skip Current File")
+        self.btn_skip.clicked.connect(lambda: setattr(self.engine, 'skip_current', True))
+        self.btn_skip.setEnabled(False)
+        self.btn_cancel = QPushButton("⏹ Cancel All")
+        self.btn_cancel.clicked.connect(lambda: setattr(self.engine, 'cancel_analysis', True))
+        self.btn_cancel.setEnabled(False)
         
         controls_layout.addWidget(self.btn_in)
         controls_layout.addWidget(self.lbl_in_dir)
@@ -308,8 +344,18 @@ class MainWindow(QMainWindow):
         controls_layout.addWidget(self.font_preview_label)
         controls_layout.addWidget(self.watermark_input)
         controls_layout.addLayout(self.watermark_layout)
+        controls_layout.addWidget(QLabel("Export Format:"))
+        controls_layout.addWidget(self.export_format_combo)
+        controls_layout.addWidget(QLabel("Crop Aspect Ratio:"))
+        controls_layout.addWidget(self.crop_ratio_combo)
         controls_layout.addWidget(self.btn_analyze)
         controls_layout.addWidget(self.progress_bar)
+        controls_layout.addWidget(QLabel("Processing Queue:"))
+        controls_layout.addWidget(self.queue_list_widget)
+        queue_controls = QHBoxLayout()
+        queue_controls.addWidget(self.btn_skip)
+        queue_controls.addWidget(self.btn_cancel)
+        controls_layout.addLayout(queue_controls)
         controls_layout.addStretch()
         
         self.tabs = QTabWidget()
@@ -321,6 +367,20 @@ class MainWindow(QMainWindow):
         self.video_label.setAlignment(Qt.AlignCenter)
         self.video_label.setStyleSheet("background-color: black;")
         preview_layout.addWidget(self.video_label)
+        
+        self.scrubber = QSlider(Qt.Horizontal)
+        self.scrubber.setRange(0, 1000)
+        self.scrubber.setEnabled(False)
+        self.scrubber.sliderMoved.connect(self.handle_scrub)
+        self.scrubber.sliderPressed.connect(self.handle_scrub_start)
+        self.scrubber.sliderReleased.connect(self.handle_scrub_end)
+        
+        self.timecode_label = QLabel("00:00 / 00:00")
+        self.timecode_label.setAlignment(Qt.AlignCenter)
+        self.timecode_label.setStyleSheet("color: #ffffff; font-size: 14px; font-weight: bold;")
+        
+        preview_layout.addWidget(self.scrubber)
+        preview_layout.addWidget(self.timecode_label)
         
         self.gallery_tab = PreviewGallery(self.engine)
         
@@ -350,6 +410,7 @@ class MainWindow(QMainWindow):
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_preview)
         self.is_previewing = False
+        self.scrubbing = False
         
         self.progress_timer = QTimer()
         self.progress_timer.timeout.connect(self.update_progress)
@@ -496,6 +557,25 @@ class MainWindow(QMainWindow):
         self.btn_calc_thresh.setText("Calculate Suggested Threshold")
         self.btn_calc_thresh.setEnabled(True)
 
+    def format_timecode(self, frame, fps):
+        total_secs = frame / max(fps, 1)
+        mins = int(total_secs // 60)
+        secs = int(total_secs % 60)
+        return f'{mins:02d}:{secs:02d}'
+
+    def handle_scrub_start(self):
+        self.scrubbing = True
+
+    def handle_scrub(self, val):
+        frame = self.engine.seek_preview(val)
+        if frame is not None:
+            self.display_frame(frame)
+            _, total, fps = self.engine.get_preview_info()
+            self.timecode_label.setText(f"{self.format_timecode(val, fps)} / {self.format_timecode(total, fps)}")
+
+    def handle_scrub_end(self):
+        self.scrubbing = False
+
     def toggle_preview(self):
         if self.is_previewing:
             self.timer.stop()
@@ -503,31 +583,64 @@ class MainWindow(QMainWindow):
             self.btn_preview.setText("Start Preview")
             self.is_previewing = False
             self.video_label.clear()
+            self.scrubber.setEnabled(False)
+            self.timecode_label.setText("00:00 / 00:00")
         else:
             files = [f for f in os.listdir(self.input_dir) if f.lower().endswith(('.mp4', '.avi', '.mov', '.mkv', '.wmv'))]
             if files:
                 if self.engine.start_preview(os.path.join(self.input_dir, files[0])):
+                    pos, total, fps = self.engine.get_preview_info()
+                    self.scrubber.setRange(0, total)
+                    self.scrubber.setValue(pos)
+                    self.scrubber.setEnabled(True)
+                    self.timecode_label.setText(f"00:00 / {self.format_timecode(total, fps)}")
                     self.timer.start(30)
                     self.btn_preview.setText("Stop Preview")
                     self.is_previewing = True
 
     def update_preview(self):
+        if self.scrubbing:
+            return
         frame = self.engine.get_annotated_preview_frame()
         if frame is not None:
-            h, w, ch = frame.shape
-            bytes_per_line = ch * w
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            qt_img = QImage(frame_rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
-            pixmap = QPixmap.fromImage(qt_img).scaled(self.video_label.size(), Qt.KeepAspectRatio)
-            self.video_label.setPixmap(pixmap)
+            self.display_frame(frame)
+            pos, total, fps = self.engine.get_preview_info()
+            if total > 0:
+                self.scrubber.setValue(pos)
+                self.timecode_label.setText(f"{self.format_timecode(pos, fps)} / {self.format_timecode(total, fps)}")
+
+    def display_frame(self, frame):
+        h, w, ch = frame.shape
+        bytes_per_line = ch * w
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        qt_img = QImage(frame_rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
+        pixmap = QPixmap.fromImage(qt_img).scaled(self.video_label.size(), Qt.KeepAspectRatio)
+        self.video_label.setPixmap(pixmap)
+
+    STATUS_ICONS = {'pending': '⏳', 'processing': '▶️', 'done': '✅', 'skipped': '⏭️'}
 
     def update_progress(self):
         self.progress_bar.setValue(int(self.engine.progress * 100))
+        for i in range(self.queue_list_widget.count()):
+            item = self.queue_list_widget.item(i)
+            fname = item.text().split(' ', 1)[-1]  # Strip icon prefix
+            status = self.engine.queue_status.get(fname, 'pending')
+            icon = self.STATUS_ICONS.get(status, '⏳')
+            item.setText(f'{icon} {fname}')
 
     def start_analysis(self):
         self.btn_analyze.setEnabled(False)
+        self.btn_skip.setEnabled(True)
+        self.btn_cancel.setEnabled(True)
         self.progress_bar.setValue(0)
         self.progress_timer.start(100)
+        
+        # Populate queue list
+        self.queue_list_widget.clear()
+        files = sorted([f for f in os.listdir(self.input_dir) if f.lower().endswith(('.mp4', '.avi', '.mov', '.mkv'))])
+        for f in files:
+            self.queue_list_widget.addItem(f'⏳ {f}')
+        
         self.thread = AnalysisThread(self.engine, self.input_dir, self.output_dir)
         self.thread.finished.connect(self.analysis_done)
         self.thread.start()
@@ -536,6 +649,15 @@ class MainWindow(QMainWindow):
         self.progress_timer.stop()
         self.progress_bar.setValue(100)
         self.btn_analyze.setEnabled(True)
+        self.btn_skip.setEnabled(False)
+        self.btn_cancel.setEnabled(False)
+        # Final queue status refresh
+        for i in range(self.queue_list_widget.count()):
+            item = self.queue_list_widget.item(i)
+            fname = item.text().split(' ', 1)[-1]
+            status = self.engine.queue_status.get(fname, 'pending')
+            icon = self.STATUS_ICONS.get(status, '⏳')
+            item.setText(f'{icon} {fname}')
         print(result)
         
         if not os.path.exists(actual_out_dir):

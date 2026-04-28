@@ -38,3 +38,38 @@ You can "burn" text into the bottom right corner of your exported images and GIF
 * **Text**: Type your desired watermark (e.g., `© 2026 StormChaser`).
 * **Font**: ZapCapture-NG automatically discovers TrueType fonts (`.ttf` or `.otf`) located in the `assets/fonts/` folder. Select your preferred style.
 * **Size Multiplier**: Because videos vary drastically in resolution (1080p vs 4K), setting a raw font size doesn't work. Instead, use the multiplier to scale the font up or down relative to the size of the video.
+
+---
+
+## 5. Export Settings
+
+### Export Format
+Choose which types of clips are saved for each detected lightning strike:
+* **GIF only** *(default)*: Saves a looping animated GIF of the strike and surrounding frames.
+* **MP4 only**: Saves a slow-motion `.mp4` video clip of the strike. Great for social sharing or editing.
+* **GIF + MP4**: Saves both formats simultaneously.
+
+### Crop Aspect Ratio
+Automatically center-crops each exported clip to a specific aspect ratio before saving:
+* **Original** *(default)*: Keeps the native aspect ratio of your video file.
+* **Square (1:1)**: Crops to a square. Perfect for Instagram posts.
+* **Portrait (9:16)**: Crops to a tall portrait frame. Perfect for TikTok, YouTube Shorts, and Instagram Reels.
+
+> **Note:** The crop is applied before the watermark is burned in, so your watermark will always appear correctly positioned within the cropped frame.
+
+---
+
+## 6. Processing Queue
+
+When processing a folder containing multiple videos, the **Processing Queue** displays the status of each file in real-time:
+
+| Icon | Status |
+|---|---|
+| ⏳ | Pending (not yet started) |
+| ▶️ | Currently processing |
+| ✅ | Done |
+| ⏭️ | Skipped |
+
+**Queue Controls:**
+* **Skip Current File**: Immediately stops processing the current video and moves to the next one in the queue. Any strikes already found in the current file will still be saved.
+* **Cancel All**: Stops the entire analysis run immediately.
