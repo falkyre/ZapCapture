@@ -41,7 +41,17 @@ You can "burn" text into the bottom right corner of your exported images and GIF
 
 ---
 
-## 5. Export Settings
+## 5. Live Preview & Scrubbing
+
+The **Live Preview** tab allows you to visualize how the detection engine "sees" your video before you start a long analysis.
+
+*   **Start/Stop Preview**: Toggles the real-time playback.
+*   **Detection Info**: While playing, the current frame's "Diff" value and your current "Threshold" are displayed in the corner. If a strike is detected, a green **STRIKE DETECTED!** notification will flash.
+*   **Timeline Scrubber**: Use the slider below the video to jump to any point in the footage. This is useful for finding specific lightning strikes to verify if your current threshold is sensitive enough to catch them.
+
+---
+
+## 6. Export Settings
 
 ### Export Format
 Choose which types of clips are saved for each detected lightning strike:
@@ -59,7 +69,7 @@ Automatically center-crops each exported clip to a specific aspect ratio before 
 
 ---
 
-## 6. Processing Queue
+## 7. Processing Queue
 
 When processing a folder containing multiple videos, the **Processing Queue** displays the status of each file in real-time:
 

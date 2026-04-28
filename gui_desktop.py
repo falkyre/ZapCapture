@@ -606,8 +606,9 @@ class MainWindow(QMainWindow):
             self.display_frame(frame)
             pos, total, fps = self.engine.get_preview_info()
             if total > 0:
-                self.scrubber.setValue(pos)
-                self.timecode_label.setText(f"{self.format_timecode(pos, fps)} / {self.format_timecode(total, fps)}")
+                current_frame = max(0, pos - 1)
+                self.scrubber.setValue(current_frame)
+                self.timecode_label.setText(f"{self.format_timecode(current_frame, fps)} / {self.format_timecode(total, fps)}")
 
     def display_frame(self, frame):
         h, w, ch = frame.shape

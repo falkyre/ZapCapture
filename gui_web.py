@@ -5,6 +5,7 @@ import base64
 import tempfile
 import shutil
 import numpy as np
+import time
 from core import ZapCore, get_available_fonts
 
 engine = ZapCore()
@@ -70,6 +71,7 @@ async def pick_output_dir():
 
 scrubber_dragging = {'active': False}
 is_programmatic_update = {'active': False}
+last_scrub_time = {'value': 0}
 
 def frame_to_timecode(frame, fps):
     total_secs = frame / max(fps, 1)
@@ -92,16 +94,24 @@ def update_preview():
         push_frame_to_preview(frame)
         pos, total, fps = engine.get_preview_info()
         if total > 0:
+            current_frame = max(0, pos - 1)
             is_programmatic_update['active'] = True
-            scrubber_slider.set_value(pos)
+            scrubber_slider.set_value(current_frame)
             is_programmatic_update['active'] = False
-            scrubber_label.set_text(f'{frame_to_timecode(pos, fps)}  /  {frame_to_timecode(total, fps)}')
+            scrubber_label.set_text(f'{frame_to_timecode(current_frame, fps)}  /  {frame_to_timecode(total, fps)}')
 
 def handle_scrub(e):
     """Called when the user drags the scrubber slider."""
     if is_programmatic_update['active']:
         return
     scrubber_dragging['active'] = True
+    
+    # Throttle updates to prevent overwhelming the server/browser
+    now = time.time()
+    if now - last_scrub_time['value'] < 0.1:  # max 10 fps while scrubbing
+        return
+    last_scrub_time['value'] = now
+
     frame_num = int(scrubber_slider.value)
     frame = engine.seek_preview(frame_num)
     if frame is not None:
@@ -132,8 +142,9 @@ def toggle_preview():
             if files:
                 if engine.start_preview(os.path.join(input_dir, files[0])):
                     _, total, fps = engine.get_preview_info()
+                    print(f"[DEBUG] Video started: {total} frames at {fps} FPS")
                     scrubber_slider.set_value(0)
-                    scrubber_slider.max = total
+                    scrubber_slider.props(f'max={total}')
                     scrubber_label.set_text(f'00:00  /  {frame_to_timecode(total, fps)}')
                     app_state['is_previewing'] = True
                     preview_timer.activate()
@@ -446,9 +457,9 @@ with ui.row().classes('w-full h-screen no-wrap'):
             with ui.tab_panel('Live Preview').classes('w-full h-full flex flex-col items-center justify-center bg-black gap-2'):
                 video_preview = ui.interactive_image(cross=True, on_mouse=handle_image_click, events=['mousedown', 'mousemove', 'mouseup']).classes('max-w-full max-h-[85%] border border-gray-700 flex-shrink')
                 with ui.column().classes('w-full px-4 gap-1'):
-                    scrubber_slider = ui.slider(min=0, max=1000, value=0, step=1
+                    scrubber_slider = ui.slider(min=0, max=100000, value=0, step=1
                         ).classes('w-full').on_value_change(handle_scrub).on('change', handle_scrub_end)
-                    scrubber_label = ui.label('00:00  /  00:00').classes('text-gray-400 text-xs text-center w-full')
+                    scrubber_label = ui.label('00:00  /  00:00').classes('text-white text-lg font-bold text-center w-full')
                 
             with ui.tab_panel('Analysis Results').classes('p-0 bg-gray-900 w-full h-full'):
                 with ui.column().classes('w-full h-full no-wrap justify-between'):

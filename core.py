@@ -221,9 +221,10 @@ class ZapCore:
         ret, frame1 = self.cap.read()
         if not ret:
             self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-            ret, self.frame0 = self.cap.read()
+            ret, frame1 = self.cap.read()
             if not ret:
                 return None
+            self.frame0 = frame1
 
         diff1 = self._count_diff(self.frame0, frame1)
         is_strike = diff1 > self.threshold
