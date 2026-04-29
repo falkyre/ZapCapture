@@ -5,6 +5,10 @@ import shutil
 import tempfile
 import numpy as np
 from PySide6.QtCore import Qt, QTimer, QThread, Signal
+
+from logging_config import get_logger, setup_logging, parse_verbose_arg
+
+logger = get_logger(__name__)
 from PySide6.QtGui import QImage, QPixmap, QMovie
 from PySide6.QtWidgets import (QApplication, QMainWindow, QLabel, QVBoxLayout, 
                                QWidget, QPushButton, QLineEdit, QHBoxLayout, QFileDialog,
@@ -170,7 +174,8 @@ class PreviewGallery(QWidget):
             if self.temp_dir and os.path.exists(self.temp_dir):
                 shutil.rmtree(self.temp_dir)
         except Exception as e:
-            print(f"Error cleaning up temp dir: {e}")
+            logger.error('Failed to clean up temp dir %s: %s', self.temp_dir, e)
+            logger.debug('Temp dir cleanup traceback:', exc_info=True)
 
 class AnalysisThread(QThread):
     finished = Signal(str, str, str)
@@ -659,7 +664,7 @@ class MainWindow(QMainWindow):
             status = self.engine.queue_status.get(fname, 'pending')
             icon = self.STATUS_ICONS.get(status, '⏳')
             item.setText(f'{icon} {fname}')
-        print(result)
+        logger.info('Analysis complete: %s', result)
         
         if not os.path.exists(actual_out_dir):
             os.makedirs(actual_out_dir)
@@ -672,6 +677,10 @@ class MainWindow(QMainWindow):
         self.tabs.setCurrentWidget(self.gallery_tab)
 
 if __name__ == "__main__":
+    verbose = parse_verbose_arg()
+    setup_logging(verbose=verbose)
+    logger.info('ZapCapture-NG Desktop starting (verbose=%s)', verbose)
+
     app = QApplication(sys.argv)
     window = MainWindow()
     window.show()

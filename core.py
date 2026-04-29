@@ -6,6 +6,10 @@ from collections import deque
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
+from logging_config import get_logger, FileError, VideoError
+
+logger = get_logger(__name__)
+
 def get_available_fonts():
     fonts_dir = os.path.join(os.path.dirname(__file__), 'assets', 'fonts')
     if not os.path.exists(fonts_dir):
@@ -361,7 +365,8 @@ class ZapCore:
                                 rgb = [cv2.cvtColor(f, cv2.COLOR_BGR2RGB) for f in mp4frames_to_save]
                                 imageio.mimsave(mp4name_to_save, rgb, fps=10, macro_block_size=1)
                             except Exception as e:
-                                print(f'[MP4] Mid-stream export error: {e}')
+                                logger.error('Mid-stream MP4 export failed for %s: %s', mp4name_to_save, e)
+                                logger.debug('Mid-stream MP4 export traceback:', exc_info=True)
                     gif_frames = []
                     gif_png_names = []
                     mp4_frames = []
@@ -401,15 +406,16 @@ class ZapCore:
 
             # Finalize any remaining MP4 frames
             if self.export_format in ('mp4', 'both') and mp4_frames and mp4name_to_save:
-                print(f'[MP4] Writing {len(mp4_frames)} frames to: {mp4name_to_save}')
+                logger.info('Writing %d frames to MP4: %s', len(mp4_frames), mp4name_to_save)
                 try:
                     rgb = [cv2.cvtColor(f, cv2.COLOR_BGR2RGB) for f in mp4_frames]
                     imageio.mimsave(mp4name_to_save, rgb, fps=10, macro_block_size=1)
-                    print(f'[MP4] Write complete: {mp4name_to_save}')
+                    logger.info('MP4 write complete: %s', mp4name_to_save)
                 except Exception as e:
-                    print(f'[MP4] Export error: {e}')
+                    logger.error('MP4 export failed for %s: %s', mp4name_to_save, e)
+                    logger.debug('MP4 export traceback:', exc_info=True)
             elif self.export_format in ('mp4', 'both'):
-                print(f'[MP4] Skipped finalize — mp4_frames={len(mp4_frames)}, mp4name_to_save={mp4name_to_save}')
+                logger.debug('MP4 finalize skipped — mp4_frames=%d, mp4name_to_save=%s', len(mp4_frames), mp4name_to_save)
 
             csv_file.close()
             video.release()

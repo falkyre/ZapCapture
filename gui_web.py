@@ -1,3 +1,5 @@
+import sys
+
 from nicegui import ui, events, run, app
 import cv2
 import os
@@ -6,7 +8,11 @@ import tempfile
 import shutil
 import numpy as np
 import time
+
+from logging_config import get_logger, setup_logging, parse_verbose_arg
 from core import ZapCore, get_available_fonts
+
+logger = get_logger(__name__)
 
 engine = ZapCore()
 
@@ -142,7 +148,7 @@ def toggle_preview():
             if files:
                 if engine.start_preview(os.path.join(input_dir, files[0])):
                     _, total, fps = engine.get_preview_info()
-                    print(f"[DEBUG] Video started: {total} frames at {fps} FPS")
+                    logger.debug('Video started: %d frames at %.1f FPS', total, fps)
                     scrubber_slider.set_value(0)
                     scrubber_slider.props(f'max={total}')
                     scrubber_label.set_text(f'00:00  /  {frame_to_timecode(total, fps)}')
@@ -480,4 +486,9 @@ with ui.row().classes('w-full h-screen no-wrap'):
                     ui.label("User guide not found.").classes('text-red-500')
 
 preview_timer = ui.timer(0.033, update_preview, active=False)
+
+verbose = parse_verbose_arg()
+setup_logging(verbose=verbose)
+logger.info('ZapCapture-NG Web starting on 0.0.0.0:8080 (verbose=%s)', verbose)
+
 ui.run(host='0.0.0.0', port=8080, title='ZapCapture-NG Web', reload=False)
