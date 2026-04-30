@@ -4,15 +4,15 @@ import cv2
 import shutil
 import tempfile
 import numpy as np
-from PySide6.QtCore import Qt, QTimer, QThread, Signal
+from PySide6.QtCore import Qt, QTimer, QThread, Signal, QRect
 
 from logging_config import get_logger, setup_logging, parse_verbose_arg
 
 logger = get_logger(__name__)
-from PySide6.QtGui import QImage, QPixmap, QMovie
+from PySide6.QtGui import QImage, QPixmap, QMovie, QPainter, QPen, QColor
 from PySide6.QtWidgets import (QApplication, QMainWindow, QLabel, QVBoxLayout, 
                                QWidget, QPushButton, QLineEdit, QHBoxLayout, QFileDialog,
-                               QTabWidget, QScrollArea, QGridLayout, QCheckBox, QComboBox, QMessageBox, QProgressBar, QRadioButton, QButtonGroup, QDoubleSpinBox, QTextBrowser, QListWidget, QSlider)
+                               QTabWidget, QScrollArea, QGridLayout, QCheckBox, QComboBox, QMessageBox, QProgressBar, QRadioButton, QButtonGroup, QDoubleSpinBox, QTextBrowser, QListWidget, QSlider, QStackedLayout)
 from core import ZapCore, get_available_fonts
 
 class HoverImageLabel(QLabel):
@@ -42,6 +42,122 @@ class HoverImageLabel(QLabel):
             self.movie.stop()
             self.setPixmap(self.static_pixmap)
         super().leaveEvent(event)
+
+
+class MaskDrawLabel(QLabel):
+    """Interactive label for drawing a mask rectangle on a video frame."""
+    mask_confirmed = Signal(int, int, int, int)   # x, y, w, h (original frame coords)
+    mask_cancelled = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self._pixmap = None
+        self._start_pt = None
+        self._end_pt = None
+        self._drawing = False
+        self._orig_w = 0
+        self._orig_h = 0
+
+    def set_frame(self, cv2_frame):
+        h, w = cv2_frame.shape[:2]
+        self._orig_w, self._orig_h = w, h
+        rgb = cv2.cvtColor(cv2_frame, cv2.COLOR_BGR2RGB)
+        qimg = QImage(rgb.data, w, h, w * 3, QImage.Format_RGB888)
+        pixmap = QPixmap.fromImage(qimg)
+
+        available_size = self.size()
+        if available_size.width() > 0 and available_size.height() > 0:
+            pixmap = pixmap.scaled(available_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+
+        self._pixmap = pixmap
+        self.setPixmap(self._pixmap)
+        self.updateGeometry()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._drawing = True
+            self._start_pt = event.position().toPoint()
+            self._end_pt = self._start_pt
+
+    def mouseMoveEvent(self, event):
+        if self._drawing:
+            self._end_pt = event.position().toPoint()
+            self.update()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._drawing = False
+            self.update()
+
+    def mouseDoubleClickEvent(self, event):
+        if self._start_pt and self._end_pt:
+            self._emit_mask()
+
+    def contextMenuEvent(self, event):
+        self.mask_cancelled.emit()
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Escape:
+            self.mask_cancelled.emit()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if self._start_pt and self._end_pt:
+            painter = QPainter(self)
+            rect = QRect(min(self._start_pt.x(), self._end_pt.x()),
+                         min(self._start_pt.y(), self._end_pt.y()),
+                         abs(self._end_pt.x() - self._start_pt.x()),
+                         abs(self._end_pt.y() - self._start_pt.y()))
+            painter.fillRect(rect, QColor(255, 0, 0, 80))
+            painter.setPen(QPen(Qt.white, 2, Qt.DashLine))
+            painter.drawRect(rect)
+
+    def _emit_mask(self):
+        if self._pixmap is None:
+            return
+        disp_w = self._pixmap.width()
+        disp_h = self._pixmap.height()
+
+        # The pixmap is centered inside the label due to KeepAspectRatio scaling.
+        # Mouse events report widget-relative coordinates, so we must subtract the
+        # centering offset (letterbox/pillarbox) before mapping to frame coordinates.
+        offset_x = (self.width() - disp_w) // 2
+        offset_y = (self.height() - disp_h) // 2
+
+        sx = self._orig_w / max(disp_w, 1)
+        sy = self._orig_h / max(disp_h, 1)
+
+        # Clamp mouse points to within the pixmap area before scaling
+        def clamp_pt(px, py):
+            px = max(offset_x, min(px, offset_x + disp_w))
+            py = max(offset_y, min(py, offset_y + disp_h))
+            return px - offset_x, py - offset_y
+
+        x1_rel, y1_rel = clamp_pt(self._start_pt.x(), self._start_pt.y())
+        x2_rel, y2_rel = clamp_pt(self._end_pt.x(), self._end_pt.y())
+
+        x = int(min(x1_rel, x2_rel) * sx)
+        y = int(min(y1_rel, y2_rel) * sy)
+        w = int(abs(x2_rel - x1_rel) * sx)
+        h = int(abs(y2_rel - y1_rel) * sy)
+
+        # Clamp final rect to original frame bounds
+        x = max(0, min(x, self._orig_w - 1))
+        y = max(0, min(y, self._orig_h - 1))
+        w = max(0, min(w, self._orig_w - x))
+        h = max(0, min(h, self._orig_h - y))
+
+        if w > 0 and h > 0:
+            self.mask_confirmed.emit(x, y, w, h)
+
+    def clear(self):
+        self._pixmap = None
+        self._start_pt = None
+        self._end_pt = None
+        self._drawing = False
+        self.update()
+
 
 class PreviewGallery(QWidget):
     def __init__(self, engine, parent=None):
@@ -368,10 +484,27 @@ class MainWindow(QMainWindow):
         # Live Preview Tab
         self.preview_widget = QWidget()
         preview_layout = QVBoxLayout(self.preview_widget)
+
+        # Stacked layout for video display (video_label and mask_draw_label share same space)
+        self.preview_stacked = QStackedLayout()
         self.video_label = QLabel("Preview Area")
         self.video_label.setAlignment(Qt.AlignCenter)
         self.video_label.setStyleSheet("background-color: black;")
-        preview_layout.addWidget(self.video_label)
+        self.preview_stacked.addWidget(self.video_label)
+
+        self.mask_draw_label = MaskDrawLabel()
+        self.mask_draw_label.mask_confirmed.connect(self.on_mask_confirmed)
+        self.preview_stacked.addWidget(self.mask_draw_label)
+
+        preview_container = QWidget()
+        preview_container.setLayout(self.preview_stacked)
+        preview_layout.addWidget(preview_container, 1)
+
+        self.mask_status_label = QLabel("")
+        self.mask_status_label.setAlignment(Qt.AlignCenter)
+        self.mask_status_label.setStyleSheet("color: #ffcc00; font-size: 12px; padding: 8px; background-color: #1a1a1a; border: 1px solid #333;")
+        self.mask_status_label.setWordWrap(True)
+        preview_layout.addWidget(self.mask_status_label)
         
         self.scrubber = QSlider(Qt.Horizontal)
         self.scrubber.setRange(0, 1000)
@@ -386,7 +519,19 @@ class MainWindow(QMainWindow):
         
         preview_layout.addWidget(self.scrubber)
         preview_layout.addWidget(self.timecode_label)
-        
+
+        self.btn_confirm_mask = QPushButton("✓ Confirm Mask")
+        self.btn_confirm_mask.setVisible(False)
+        self.btn_confirm_mask.clicked.connect(self.confirm_mask)
+        self.btn_confirm_mask.setStyleSheet("""
+            QPushButton {
+                background-color: #22c55e; color: white; font-weight: bold;
+                padding: 6px 16px; border-radius: 4px; font-size: 12px;
+            }
+            QPushButton:hover { background-color: #16a34a; }
+        """)
+        preview_layout.addWidget(self.btn_confirm_mask)
+
         self.gallery_tab = PreviewGallery(self.engine)
         
         self.tabs.addTab(self.preview_widget, "Live Preview")
@@ -416,7 +561,8 @@ class MainWindow(QMainWindow):
         self.timer.timeout.connect(self.update_preview)
         self.is_previewing = False
         self.scrubbing = False
-        
+        self.is_mask_mode = False
+
         self.progress_timer = QTimer()
         self.progress_timer.timeout.connect(self.update_progress)
         
@@ -485,31 +631,38 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Error", "Could not read the first video to define a mask.")
             return
 
-        h, w = frame.shape[:2]
-        max_height = 800
-        if h > max_height:
-            scale_display = max_height / h
-            display_frame = cv2.resize(frame, (int(w * scale_display), max_height))
-        else:
-            scale_display = 1.0
-            display_frame = frame
+        self.is_mask_mode = True
+        self.mask_status_label.setText("Click and drag to draw mask area. Click the 'Confirm Mask' button below, or press Escape/right-click to cancel.")
 
-        window_name = "Draw Box over Area to IGNORE (Press Space to confirm)"
-        roi = cv2.selectROI(window_name, display_frame, showCrosshair=True, fromCenter=False)
-        cv2.destroyWindow(window_name)
-        cv2.waitKey(1)
+        self.mask_draw_label.set_frame(frame)
+        self.preview_stacked.setCurrentIndex(1)
+        self.btn_confirm_mask.setVisible(True)
 
-        if roi[2] > 0 and roi[3] > 0:
-            real_x = int(roi[0] / scale_display)
-            real_y = int(roi[1] / scale_display)
-            real_w = int(roi[2] / scale_display)
-            real_h = int(roi[3] / scale_display)
-            
-            self.engine.set_mask(real_x, real_y, real_w, real_h)
-            self.btn_set_mask.setText("Area to Ignore: Custom Mask Applied")
-        else:
+    def confirm_mask(self):
+        if self.mask_draw_label._start_pt and self.mask_draw_label._end_pt:
+            self.mask_draw_label._emit_mask()
+
+    def on_mask_confirmed(self, x, y, w, h):
+        self.engine.set_mask(x, y, w, h)
+        self.btn_set_mask.setText("Area to Ignore: Custom Mask Applied")
+        logger.info('Mask set at x=%d, y=%d, w=%d, h=%d', x, y, w, h)
+        self.exit_mask_mode()
+
+    def exit_mask_mode(self):
+        self.is_mask_mode = False
+        self.preview_stacked.setCurrentIndex(0)
+        self.mask_draw_label.clear()
+        self.mask_status_label.setText("")
+        self.btn_confirm_mask.setVisible(False)
+
+    def keyPressEvent(self, event):
+        if self.is_mask_mode and event.key() == Qt.Key_Escape:
             self.engine.clear_mask()
             self.btn_set_mask.setText("Select Area to Ignore (Mask)")
+            logger.info('Mask selection cancelled')
+            self.exit_mask_mode()
+        else:
+            super().keyPressEvent(event)
 
     def clear_mask(self):
         self.engine.clear_mask()

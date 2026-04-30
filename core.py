@@ -3,6 +3,7 @@ import os
 import imageio
 import shutil
 from collections import deque
+import threading
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
@@ -37,22 +38,100 @@ class ZapCore:
         self.watermark_size = 1.0
         
         # State
-        self.progress = 0.0
-        self.is_analyzing = False
-        self.skip_current = False
-        self.cancel_analysis = False
-        self.current_file = ""
-        self.queue_status = {}  # filename -> 'pending'|'processing'|'done'|'skipped'
+        self._progress = 0.0
+        self._is_analyzing = False
+        self._skip_current = False
+        self._cancel_analysis = False
+        self._current_file = ""
+        self._queue_status = {}  # filename -> 'pending'|'processing'|'done'|'skipped'
         self.png_to_mp4 = {}   # png_path -> mp4_path, for selective save
         self.cap = None
         self.frame0 = None
         self.strike_display_frames = 0
+        self._state_lock = threading.Lock()
 
     def set_mask(self, x, y, w, h):
+        if w <= 0 or h <= 0:
+            logger.warning('set_mask called with invalid dimensions: w=%s, h=%s — mask cleared', w, h)
+            self.mask_rect = None
+            return
+        if x < 0 or y < 0:
+            logger.warning('set_mask called with negative coordinates: x=%s, y=%s — clamping to zero', x, y)
+            x = max(0, x)
+            y = max(0, y)
         self.mask_rect = (x, y, w, h)
 
     def clear_mask(self):
         self.mask_rect = None
+
+    # Thread-safe state getters for GUI access
+    @property
+    def progress(self):
+        with self._state_lock:
+            return self._progress
+
+    @property
+    def is_analyzing(self):
+        with self._state_lock:
+            return self._is_analyzing
+
+    @property
+    def queue_status(self):
+        with self._state_lock:
+            return dict(self._queue_status)
+
+    @property
+    def current_file(self):
+        with self._state_lock:
+            return self._current_file
+
+    @property
+    def cancel_analysis(self):
+        with self._state_lock:
+            return self._cancel_analysis
+
+    @property
+    def skip_current(self):
+        with self._state_lock:
+            return self._skip_current
+
+    @progress.setter
+    def progress(self, value):
+        with self._state_lock:
+            self._progress = value
+
+    @is_analyzing.setter
+    def is_analyzing(self, value):
+        with self._state_lock:
+            self._is_analyzing = value
+
+    @queue_status.setter
+    def queue_status(self, value):
+        with self._state_lock:
+            self._queue_status = dict(value)
+
+    @current_file.setter
+    def current_file(self, value):
+        with self._state_lock:
+            self._current_file = value
+
+    @cancel_analysis.setter
+    def cancel_analysis(self, value):
+        with self._state_lock:
+            self._cancel_analysis = value
+
+    @skip_current.setter
+    def skip_current(self, value):
+        with self._state_lock:
+            self._skip_current = value
+
+    def set_queue_status(self, filename, status):
+        with self._state_lock:
+            self._queue_status[filename] = status
+
+    def get_queue_status(self):
+        with self._state_lock:
+            return dict(self._queue_status)
 
     def _apply_crop(self, frame):
         """Center-crops the frame to the selected aspect ratio."""
@@ -283,7 +362,7 @@ class ZapCore:
 
             self.skip_current = False
             self.current_file = filename
-            self.queue_status[filename] = 'processing'
+            self.set_queue_status(filename, 'processing')
 
             video_path = os.path.join(input_dir, filename)
             video = cv2.VideoCapture(video_path)
@@ -293,12 +372,12 @@ class ZapCore:
             orig_h = int(video.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
             if nframes == 0:
-                self.queue_status[filename] = 'skipped'
+                self.set_queue_status(filename, 'skipped')
                 continue
 
             ret, prev_frame = video.read()
             if not ret:
-                self.queue_status[filename] = 'skipped'
+                self.set_queue_status(filename, 'skipped')
                 continue
 
             # Determine output frame dimensions after cropping
@@ -309,6 +388,8 @@ class ZapCore:
             gif_frames = []
             gif_png_names = []
             mp4_frames = []   # Collected separately for imageio MP4 export
+            mp4frames_to_save = []  # Reference to mp4_frames for mid-stream finalize
+            gif_name_to_save = None
             mp4name_to_save = None
             deadzone = 0
             file_strikes = 0
@@ -317,113 +398,115 @@ class ZapCore:
             csv_path = os.path.join(output_dir, f"{filename_clean}.csv")
             csv_file = open(csv_path, 'w')
 
-            for i in range(1, nframes):
-                if self.skip_current or self.cancel_analysis:
-                    break
+            try:
+                for i in range(1, nframes):
+                    if self.skip_current or self.cancel_analysis:
+                        break
 
-                ret, frame1 = video.read()
-                if not ret:
-                    break
+                    ret, frame1 = video.read()
+                    if not ret:
+                        break
 
-                self.progress = ((file_idx / total_files) + ((i / nframes) / total_files))
+                    self.progress = ((file_idx / total_files) + ((i / nframes) / total_files))
 
-                diff1 = self._count_diff(prev_frame, frame1)
-                is_strike = diff1 > self.threshold
-                csv_file.write(f"{video_path}, {diff1}\n")
+                    diff1 = self._count_diff(prev_frame, frame1)
+                    is_strike = diff1 > self.threshold
+                    csv_file.write(f"{video_path}, {diff1}\n")
 
-                if self.output_format == 'timestamp' and fps > 0:
-                    timestamp = str(round(i / fps, 2)).replace('.', '-')
-                    imname = os.path.join(output_dir, f"{filename_clean}_{timestamp}.png")
-                    gifname = os.path.join(output_dir, f"{filename_clean}_{timestamp}.gif")
-                    mp4name = os.path.join(output_dir, f"{filename_clean}_{timestamp}.mp4")
-                else:
-                    imname = os.path.join(output_dir, f"{filename_clean}_{i:06d}.png")
-                    gifname = os.path.join(output_dir, f"{filename_clean}_{i:06d}.gif")
-                    mp4name = os.path.join(output_dir, f"{filename_clean}_{i:06d}.mp4")
+                    if self.output_format == 'timestamp' and fps > 0:
+                        timestamp = str(round(i / fps, 2)).replace('.', '-')
+                        imname = os.path.join(output_dir, f"{filename_clean}_{timestamp}.png")
+                        gifname = os.path.join(output_dir, f"{filename_clean}_{timestamp}.gif")
+                        mp4name = os.path.join(output_dir, f"{filename_clean}_{timestamp}.mp4")
+                    else:
+                        imname = os.path.join(output_dir, f"{filename_clean}_{i:06d}.png")
+                        gifname = os.path.join(output_dir, f"{filename_clean}_{i:06d}.gif")
+                        mp4name = os.path.join(output_dir, f"{filename_clean}_{i:06d}.mp4")
 
-                cropped_frame = self._apply_crop(frame1)
-                save_frame = self._apply_watermark(cropped_frame.copy())
+                    cropped_frame = self._apply_crop(frame1)
+                    save_frame = self._apply_watermark(cropped_frame.copy())
 
-                if is_strike:
-                    file_strikes += 1
+                    if is_strike:
+                        file_strikes += 1
 
-                if deadzone == 0 and file_strikes > 1:
-                    # Finalize previous strike clip
-                    if len(gif_frames) > 0:
-                        if self.export_format in ('gif', 'both'):
-                            rgb_frames = [cv2.cvtColor(f, cv2.COLOR_BGR2RGB) for f in gif_frames]
-                            try:
-                                imageio.mimsave(gif_name_to_save, rgb_frames, fps=10, loop=0)
-                                for png_path in gif_png_names:
-                                    expected_gif = png_path.replace('.png', '.gif')
-                                    if expected_gif != gif_name_to_save:
-                                        shutil.copy2(gif_name_to_save, expected_gif)
-                            except:
-                                pass
-                        if self.export_format in ('mp4', 'both') and mp4frames_to_save and mp4name_to_save:
-                            try:
-                                rgb = [cv2.cvtColor(f, cv2.COLOR_BGR2RGB) for f in mp4frames_to_save]
-                                imageio.mimsave(mp4name_to_save, rgb, fps=10, macro_block_size=1)
-                            except Exception as e:
-                                logger.error('Mid-stream MP4 export failed for %s: %s', mp4name_to_save, e)
-                                logger.debug('Mid-stream MP4 export traceback:', exc_info=True)
-                    gif_frames = []
-                    gif_png_names = []
-                    mp4_frames = []
-                    mp4name_to_save = None
-                    file_strikes = 0
+                    if deadzone == 0 and file_strikes > 1:
+                        # Finalize previous strike clip
+                        if len(gif_frames) > 0:
+                            if self.export_format in ('gif', 'both'):
+                                rgb_frames = [cv2.cvtColor(f, cv2.COLOR_BGR2RGB) for f in gif_frames]
+                                try:
+                                    imageio.mimsave(gif_name_to_save, rgb_frames, fps=10, loop=0)
+                                    for png_path in gif_png_names:
+                                        expected_gif = png_path.replace('.png', '.gif')
+                                        if expected_gif != gif_name_to_save:
+                                            shutil.copy2(gif_name_to_save, expected_gif)
+                                except Exception as e:
+                                    logger.error('GIF export failed for %s: %s', gif_name_to_save, e)
+                                    logger.debug('GIF export traceback:', exc_info=True)
+                            if self.export_format in ('mp4', 'both') and mp4frames_to_save and mp4name_to_save:
+                                try:
+                                    rgb = [cv2.cvtColor(f, cv2.COLOR_BGR2RGB) for f in mp4frames_to_save]
+                                    imageio.mimsave(mp4name_to_save, rgb, fps=10, macro_block_size=1)
+                                except Exception as e:
+                                    logger.error('Mid-stream MP4 export failed for %s: %s', mp4name_to_save, e)
+                                    logger.debug('Mid-stream MP4 export traceback:', exc_info=True)
+                        gif_frames = []
+                        gif_png_names = []
+                        mp4_frames = []
+                        mp4name_to_save = None
+                        file_strikes = 0
 
-                if is_strike:
-                    # Initialize MP4 reference FIRST so buffer frames are registered
-                    if self.export_format in ('mp4', 'both'):
-                        mp4name_to_save = mp4name
-                        mp4frames_to_save = mp4_frames  # reference
-
-                    while len(frame_buffer) > 0:
-                        buf_frame, _, buf_imname = frame_buffer.popleft()
-                        cv2.imwrite(buf_imname, buf_frame)
-                        gif_frames.append(buf_frame)
-                        gif_png_names.append(buf_imname)
+                    if is_strike:
+                        # Initialize MP4 reference FIRST so buffer frames are registered
                         if self.export_format in ('mp4', 'both'):
-                            mp4_frames.append(buf_frame)
-                            self.png_to_mp4[buf_imname] = mp4name_to_save
-                    deadzone = self.buffer_frames
-                    gif_name_to_save = gifname
+                            mp4name_to_save = mp4name
+                            mp4frames_to_save = mp4_frames  # reference
 
-                if deadzone > 0:
-                    cv2.imwrite(imname, save_frame)
-                    gif_frames.append(save_frame)
-                    gif_png_names.append(imname)
-                    if self.export_format in ('mp4', 'both'):
-                        mp4_frames.append(save_frame)
-                        self.png_to_mp4[imname] = mp4name_to_save
-                    deadzone -= 1
-                else:
-                    if self.buffer_frames > 0:
-                        frame_buffer.append((save_frame, i, imname))
+                        while len(frame_buffer) > 0:
+                            buf_frame, _, buf_imname = frame_buffer.popleft()
+                            cv2.imwrite(buf_imname, buf_frame)
+                            gif_frames.append(buf_frame)
+                            gif_png_names.append(buf_imname)
+                            if self.export_format in ('mp4', 'both'):
+                                mp4_frames.append(buf_frame)
+                                self.png_to_mp4[buf_imname] = mp4name_to_save
+                        deadzone = self.buffer_frames
+                        gif_name_to_save = gifname
 
-                prev_frame = frame1
+                    if deadzone > 0:
+                        cv2.imwrite(imname, save_frame)
+                        gif_frames.append(save_frame)
+                        gif_png_names.append(imname)
+                        if self.export_format in ('mp4', 'both'):
+                            mp4_frames.append(save_frame)
+                            self.png_to_mp4[imname] = mp4name_to_save
+                        deadzone -= 1
+                    else:
+                        if self.buffer_frames > 0:
+                            frame_buffer.append((save_frame, i, imname))
 
-            # Finalize any remaining MP4 frames
-            if self.export_format in ('mp4', 'both') and mp4_frames and mp4name_to_save:
-                logger.info('Writing %d frames to MP4: %s', len(mp4_frames), mp4name_to_save)
-                try:
-                    rgb = [cv2.cvtColor(f, cv2.COLOR_BGR2RGB) for f in mp4_frames]
-                    imageio.mimsave(mp4name_to_save, rgb, fps=10, macro_block_size=1)
-                    logger.info('MP4 write complete: %s', mp4name_to_save)
-                except Exception as e:
-                    logger.error('MP4 export failed for %s: %s', mp4name_to_save, e)
-                    logger.debug('MP4 export traceback:', exc_info=True)
-            elif self.export_format in ('mp4', 'both'):
-                logger.debug('MP4 finalize skipped — mp4_frames=%d, mp4name_to_save=%s', len(mp4_frames), mp4name_to_save)
+                    prev_frame = frame1
 
-            csv_file.close()
+                # Finalize any remaining MP4 frames
+                if self.export_format in ('mp4', 'both') and mp4_frames and mp4name_to_save:
+                    logger.info('Writing %d frames to MP4: %s', len(mp4_frames), mp4name_to_save)
+                    try:
+                        rgb = [cv2.cvtColor(f, cv2.COLOR_BGR2RGB) for f in mp4_frames]
+                        imageio.mimsave(mp4name_to_save, rgb, fps=10, macro_block_size=1)
+                        logger.info('MP4 write complete: %s', mp4name_to_save)
+                    except Exception as e:
+                        logger.error('MP4 export failed for %s: %s', mp4name_to_save, e)
+                        logger.debug('MP4 export traceback:', exc_info=True)
+                elif self.export_format in ('mp4', 'both'):
+                    logger.debug('MP4 finalize skipped — mp4_frames=%d, mp4name_to_save=%s', len(mp4_frames), mp4name_to_save)
+            finally:
+                csv_file.close()
             video.release()
 
             if self.skip_current:
-                self.queue_status[filename] = 'skipped'
+                self.set_queue_status(filename, 'skipped')
             else:
-                self.queue_status[filename] = 'done'
+                self.set_queue_status(filename, 'done')
 
         self.progress = 1.0
         self.is_analyzing = False
