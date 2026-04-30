@@ -21,7 +21,12 @@ app_state = {
     'output_folder': './output',
     'temp_folder': '',
     'is_previewing': False,
-    'gallery_selection': {}
+    'gallery_selection': {},
+    'strikes': [],
+    'current_video_path': '',
+    'scan_progress': 0,
+    'is_scanning': False,
+    'progress_timer': None
 }
 
 mask_clicks = []
@@ -147,6 +152,7 @@ def toggle_preview():
             files = [f for f in os.listdir(input_dir) if f.lower().endswith(('.mp4', '.avi', '.mov', '.mkv', '.wmv'))]
             if files:
                 if engine.start_preview(os.path.join(input_dir, files[0])):
+                    app_state['current_video_path'] = os.path.join(input_dir, files[0])
                     _, total, fps = engine.get_preview_info()
                     logger.debug('Video started: %d frames at %.1f FPS', total, fps)
                     scrubber_slider.set_value(0)
@@ -156,6 +162,7 @@ def toggle_preview():
                     preview_timer.activate()
                     preview_btn.set_text('Stop Live Preview')
                     preview_btn.classes(remove='bg-blue-500', add='bg-red-500')
+                    start_strike_scan()
                     return
         ui.notify("Could not open a video in the input directory.", type='negative')
 
@@ -236,6 +243,86 @@ async def calculate_suggested_threshold():
         thresh_input.update()
     else:
         ui.notify('Could not calculate threshold.', type='negative')
+
+
+def update_scan_progress():
+    if not app_state['is_scanning']:
+        return
+    strike_scan_progress.set_value(app_state['scan_progress'])
+
+def start_strike_scan():
+    if not app_state['is_previewing'] or not app_state.get('current_video_path'):
+        return
+    app_state['strikes'] = []
+    app_state['scan_progress'] = 0
+    app_state['is_scanning'] = True
+    strike_scan_progress.set_visibility(True)
+    strike_scan_progress.set_value(0)
+    strike_list_label.set_visibility(False)
+    strike_table.set_visibility(False)
+    strike_table.update_rows([])
+    strike_rescan_btn.set_visibility(False)
+    if app_state.get('progress_timer'):
+        app_state['progress_timer'].cancel()
+    app_state['progress_timer'] = ui.timer(0.2, update_scan_progress)
+
+    async def do_scan():
+        def progress_callback(pct):
+            app_state['scan_progress'] = pct
+        strikes = await run.io_bound(
+            lambda: engine.scan_for_strikes(app_state['current_video_path'], progress_callback=progress_callback)
+        )
+        app_state['is_scanning'] = False
+        app_state['scan_progress'] = 100
+        strike_scan_progress.set_value(100)
+        if app_state.get('progress_timer'):
+            app_state['progress_timer'].cancel()
+            app_state['progress_timer'] = None
+        strike_rescan_btn.set_visibility(True)
+        if strikes:
+            strike_list_label.set_visibility(True)
+            rows = []
+            for strike in strikes:
+                ts = strike['timestamp']
+                mins = int(ts // 60)
+                secs = int(ts % 60)
+                rows.append({
+                    'time': f"{mins:02d}:{secs:02d}",
+                    'diff': strike['diff'],
+                    'frame': strike['frame']
+                })
+            strike_table.update_rows(rows)
+            strike_table.set_visibility(True)
+            logger.info('Strike scan done: %d strikes found', len(strikes))
+        else:
+            strike_table.update_rows([{'time': 'No strikes detected.', 'diff': '', 'frame': -1}])
+
+    from nicegui import background_tasks
+    background_tasks.create(do_scan())
+
+
+def seek_to_strike(e):
+    args = e.args if isinstance(e.args, list) else [e.args]
+    row = args[1] if len(args) > 1 else {}
+    frame_num = row.get('frame', -1) if isinstance(row, dict) else -1
+    if frame_num < 0:
+        return
+    frame = engine.seek_preview(frame_num)
+    if frame is not None:
+        push_frame_to_preview(frame)
+        _, total, fps = engine.get_preview_info()
+        is_programmatic_update['active'] = True
+        scrubber_slider.set_value(frame_num)
+        is_programmatic_update['active'] = False
+        scrubber_label.set_text(f'{frame_to_timecode(frame_num, fps)}  /  {frame_to_timecode(total, fps)}')
+
+
+def frame_to_timecode(frame, fps):
+    total_secs = frame / max(fps, 1)
+    mins = int(total_secs // 60)
+    secs = int(total_secs % 60)
+    return f'{mins:02d}:{secs:02d}'
+
 
 STATUS_ICONS = {'pending': '⏳', 'processing': '▶️', 'done': '✅', 'skipped': '⏭️'}
 
@@ -461,11 +548,27 @@ with ui.row().classes('w-full h-screen no-wrap'):
             
         with ui.tab_panels(tabs, value='Live Preview').classes('w-full h-full bg-black p-4') as tabs_panel:
             with ui.tab_panel('Live Preview').classes('w-full h-full flex flex-col items-center justify-center bg-black gap-2'):
-                video_preview = ui.interactive_image(cross=True, on_mouse=handle_image_click, events=['mousedown', 'mousemove', 'mouseup']).classes('max-w-full max-h-[85%] border border-gray-700 flex-shrink')
+                video_preview = ui.interactive_image(cross=True, on_mouse=handle_image_click, events=['mousedown', 'mousemove', 'mouseup']).classes('max-w-full max-h-[75%] border border-gray-700 flex-shrink')
                 with ui.column().classes('w-full px-4 gap-1'):
                     scrubber_slider = ui.slider(min=0, max=100000, value=0, step=1
                         ).classes('w-full').on_value_change(handle_scrub).on('change', handle_scrub_end)
                     scrubber_label = ui.label('00:00  /  00:00').classes('text-white text-lg font-bold text-center w-full')
+                with ui.column().classes('w-full px-4 gap-1'):
+                    strike_scan_progress = ui.linear_progress(value=0, show_value=False,
+                        ).classes('w-full').props('visible=False')
+                    strike_list_label = ui.label('Detected Strikes (click to seek):').classes('text-white text-sm font-bold')
+                    strike_list_label.set_visibility(False)
+                    with ui.element('div').classes('w-full').style('max-height: 200px; overflow-y: auto;'):
+                        strike_table = ui.table(
+                            columns=[{'name': 'time', 'label': 'Time', 'field': 'time', 'align': 'left'},
+                                     {'name': 'diff', 'label': 'Diff', 'field': 'diff', 'align': 'right'}],
+                            rows=[],
+                        ).classes('w-full text-sm').props('dense')
+                        strike_table.on('row-click', lambda e: seek_to_strike(e))
+                        strike_table.set_visibility(False)
+                    strike_rescan_btn = ui.button('Rescan for Strikes', on_click=start_strike_scan
+                        ).classes('bg-blue-600')
+                    strike_rescan_btn.set_visibility(False)
                 
             with ui.tab_panel('Analysis Results').classes('p-0 bg-gray-900 w-full h-full'):
                 with ui.column().classes('w-full h-full no-wrap justify-between'):

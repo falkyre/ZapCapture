@@ -49,6 +49,8 @@ class ZapCore:
         self.frame0 = None
         self.strike_display_frames = 0
         self._state_lock = threading.Lock()
+        self._strike_list = []
+        self._current_video_path = ""
 
     def set_mask(self, x, y, w, h):
         if w <= 0 or h <= 0:
@@ -124,6 +126,11 @@ class ZapCore:
     def skip_current(self, value):
         with self._state_lock:
             self._skip_current = value
+
+    @property
+    def strike_list(self):
+        with self._state_lock:
+            return list(self._strike_list)
 
     def set_queue_status(self, filename, status):
         with self._state_lock:
@@ -268,6 +275,7 @@ class ZapCore:
         if self.cap:
             self.cap.release()
         self.cap = cv2.VideoCapture(video_path)
+        self._current_video_path = video_path
         ret, self.frame0 = self.cap.read()
         return ret
 
@@ -275,6 +283,42 @@ class ZapCore:
         if self.cap:
             self.cap.release()
             self.cap = None
+
+    def scan_for_strikes(self, video_path, progress_callback=None):
+        self._current_video_path = video_path
+        self._strike_list = []
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            return []
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30
+        nframes = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        ret, frame0 = cap.read()
+        if not ret:
+            cap.release()
+            return []
+        strikes = []
+        last_progress_report = -1
+        for i in range(1, nframes):
+            ret, frame1 = cap.read()
+            if not ret:
+                break
+            diff = self._count_diff(frame0, frame1)
+            if diff > self.threshold:
+                strikes.append({
+                    "frame": i,
+                    "diff": int(diff),
+                    "timestamp": i / fps
+                })
+            frame0 = frame1
+            if progress_callback is not None and nframes > 0:
+                pct = int((i / nframes) * 100)
+                if pct >= last_progress_report + 5:
+                    last_progress_report = pct
+                    progress_callback(pct)
+        cap.release()
+        logger.info('Strike scan complete: %d strikes found in %s', len(strikes), video_path)
+        self._strike_list = strikes
+        return strikes
 
     def get_preview_info(self):
         """Returns (current_frame, total_frames, fps) for scrubber UI."""

@@ -10,9 +10,9 @@ from logging_config import get_logger, setup_logging, parse_verbose_arg
 
 logger = get_logger(__name__)
 from PySide6.QtGui import QImage, QPixmap, QMovie, QPainter, QPen, QColor
-from PySide6.QtWidgets import (QApplication, QMainWindow, QLabel, QVBoxLayout, 
+from PySide6.QtWidgets import (QApplication, QMainWindow, QLabel, QVBoxLayout,
                                QWidget, QPushButton, QLineEdit, QHBoxLayout, QFileDialog,
-                               QTabWidget, QScrollArea, QGridLayout, QCheckBox, QComboBox, QMessageBox, QProgressBar, QRadioButton, QButtonGroup, QDoubleSpinBox, QTextBrowser, QListWidget, QSlider, QStackedLayout)
+                               QTabWidget, QScrollArea, QGridLayout, QCheckBox, QComboBox, QMessageBox, QProgressBar, QRadioButton, QButtonGroup, QDoubleSpinBox, QTextBrowser, QListWidget, QListWidgetItem, QSlider, QStackedLayout)
 from core import ZapCore, get_available_fonts
 
 class HoverImageLabel(QLabel):
@@ -295,17 +295,61 @@ class PreviewGallery(QWidget):
 
 class AnalysisThread(QThread):
     finished = Signal(str, str, str)
-    
+
     def __init__(self, engine, in_dir, out_dir):
         super().__init__()
         self.engine = engine
         self.in_dir = in_dir
         self.out_dir = out_dir
-        
+
     def run(self):
         temp_folder = tempfile.mkdtemp(prefix="zapcapture_")
         result = self.engine.run_analysis(self.in_dir, temp_folder)
         self.finished.emit(result, temp_folder, self.out_dir)
+
+
+class StrikeScanThread(QThread):
+    progress = Signal(int)
+    finished = Signal(list)
+
+    def __init__(self, engine, video_path):
+        super().__init__()
+        self.engine = engine
+        self.video_path = video_path
+
+    def run(self):
+        cap = cv2.VideoCapture(self.video_path)
+        if not cap.isOpened():
+            self.finished.emit([])
+            return
+        nframes = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        cap.release()
+
+        strikes = []
+        cap2 = cv2.VideoCapture(self.video_path)
+        ret, frame0 = cap2.read()
+        if not ret:
+            cap2.release()
+            self.finished.emit([])
+            return
+        fps = cap2.get(cv2.CAP_PROP_FPS) or 30
+        for i in range(1, nframes):
+            ret, frame1 = cap2.read()
+            if not ret:
+                break
+            diff = self.engine._count_diff(frame0, frame1)
+            if diff > self.engine.threshold:
+                strikes.append({
+                    "frame": i,
+                    "diff": int(diff),
+                    "timestamp": i / fps
+                })
+            frame0 = frame1
+            if i % 500 == 0:
+                self.progress.emit(int((i / nframes) * 100))
+        cap2.release()
+        self.finished.emit(strikes)
+
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -520,6 +564,51 @@ class MainWindow(QMainWindow):
         preview_layout.addWidget(self.scrubber)
         preview_layout.addWidget(self.timecode_label)
 
+        self.strike_scan_progress = QProgressBar()
+        self.strike_scan_progress.setAlignment(Qt.AlignHCenter | Qt.AlignVCenter)
+        self.strike_scan_progress.setValue(0)
+        self.strike_scan_progress.setFixedHeight(8)
+        self.strike_scan_progress.setStyleSheet("""
+            QProgressBar {
+                border: 1px solid #444;
+                background-color: #111;
+                text-align: center;
+                color: #aaa;
+                font-size: 10px;
+            }
+            QProgressBar::chunk {
+                background-color: #3b82f6;
+                width: 15px;
+                margin: 1px;
+            }
+        """)
+        self.strike_scan_progress.setVisible(False)
+        preview_layout.addWidget(self.strike_scan_progress)
+
+        self.strike_list_label = QLabel("Detected Strikes (click to seek):")
+        self.strike_list_label.setStyleSheet("color: #ccc; font-size: 12px; font-weight: bold;")
+        self.strike_list_label.setVisible(False)
+        preview_layout.addWidget(self.strike_list_label)
+
+        self.strike_list_widget = QListWidget()
+        self.strike_list_widget.setFixedHeight(150)
+        self.strike_list_widget.setStyleSheet("background-color: #111; color: #ccc; font-size: 11px;")
+        self.strike_list_widget.itemClicked.connect(self.on_strike_list_item_clicked)
+        self.strike_list_widget.setVisible(False)
+        preview_layout.addWidget(self.strike_list_widget)
+
+        self.strike_rescan_btn = QPushButton("Rescan for Strikes")
+        self.strike_rescan_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #3b82f6; color: white; font-weight: bold;
+                padding: 4px 12px; border-radius: 4px; font-size: 11px;
+            }
+            QPushButton:hover { background-color: #2563eb; }
+        """)
+        self.strike_rescan_btn.clicked.connect(self.on_rescan_strikes)
+        self.strike_rescan_btn.setVisible(False)
+        preview_layout.addWidget(self.strike_rescan_btn)
+
         self.btn_confirm_mask = QPushButton("✓ Confirm Mask")
         self.btn_confirm_mask.setVisible(False)
         self.btn_confirm_mask.clicked.connect(self.confirm_mask)
@@ -655,6 +744,43 @@ class MainWindow(QMainWindow):
         self.mask_status_label.setText("")
         self.btn_confirm_mask.setVisible(False)
 
+    def start_strike_scan(self, video_path):
+        self.strike_list_widget.clear()
+        self.strike_list_widget.setVisible(True)
+        self.strike_list_label.setVisible(True)
+        self.strike_scan_progress.setValue(0)
+        self.strike_scan_progress.setVisible(True)
+        self.strike_rescan_btn.setVisible(False)
+        self.strike_scan_thread = StrikeScanThread(self.engine, video_path)
+        self.strike_scan_thread.progress.connect(self.on_strike_scan_progress)
+        self.strike_scan_thread.finished.connect(self.on_strike_scan_done)
+        self.strike_scan_thread.start()
+
+    def on_strike_scan_progress(self, percent):
+        self.strike_scan_progress.setValue(percent)
+
+    def on_strike_scan_done(self, strike_list):
+        self.strike_scan_progress.setVisible(False)
+        self.strike_rescan_btn.setVisible(True)
+        for strike in strike_list:
+            ts = strike["timestamp"]
+            mins = int(ts // 60)
+            secs = int(ts % 60)
+            label = f"{mins:02d}:{secs:02d}  Diff: {strike['diff']}"
+            item = QListWidgetItem(label)
+            item.setData(Qt.UserRole, strike["frame"])
+            self.strike_list_widget.addItem(item)
+        logger.info('Strike scan done: %d strikes found', len(strike_list))
+
+    def on_strike_list_item_clicked(self, item):
+        frame_num = item.data(Qt.UserRole)
+        if frame_num is not None:
+            self.handle_scrub(frame_num)
+
+    def on_rescan_strikes(self):
+        if self.engine._current_video_path:
+            self.start_strike_scan(self.engine._current_video_path)
+
     def keyPressEvent(self, event):
         if self.is_mask_mode and event.key() == Qt.Key_Escape:
             self.engine.clear_mask()
@@ -743,10 +869,17 @@ class MainWindow(QMainWindow):
             self.video_label.clear()
             self.scrubber.setEnabled(False)
             self.timecode_label.setText("00:00 / 00:00")
+            self.strike_list_widget.clear()
+            self.strike_list_widget.setVisible(False)
+            self.strike_list_label.setVisible(False)
+            self.strike_scan_progress.setVisible(False)
+            self.strike_rescan_btn.setVisible(False)
         else:
             files = [f for f in os.listdir(self.input_dir) if f.lower().endswith(('.mp4', '.avi', '.mov', '.mkv', '.wmv'))]
             if files:
-                if self.engine.start_preview(os.path.join(self.input_dir, files[0])):
+                video_path = os.path.join(self.input_dir, files[0])
+                if self.engine.start_preview(video_path):
+                    self.engine._current_video_path = video_path
                     pos, total, fps = self.engine.get_preview_info()
                     self.scrubber.setRange(0, total)
                     self.scrubber.setValue(pos)
@@ -755,6 +888,7 @@ class MainWindow(QMainWindow):
                     self.timer.start(30)
                     self.btn_preview.setText("Stop Preview")
                     self.is_previewing = True
+                    self.start_strike_scan(video_path)
 
     def update_preview(self):
         if self.scrubbing:
