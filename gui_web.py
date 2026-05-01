@@ -16,6 +16,13 @@ logger = get_logger(__name__)
 
 engine = ZapCore()
 
+app.add_static_files('/favicons', './assets/favicons')
+ui.add_head_html('<link rel="icon" type="image/x-icon" href="/favicons/favicon.ico">')
+ui.add_head_html('<link rel="icon" type="image/png" sizes="32x32" href="/favicons/favicon-32x32.png">')
+ui.add_head_html('<link rel="icon" type="image/png" sizes="16x16" href="/favicons/favicon-16x16.png">')
+ui.add_head_html('<link rel="apple-touch-icon" sizes="180x180" href="/favicons/apple-touch-icon.png">')
+ui.add_head_html('<link rel="manifest" href="/favicons/site.webmanifest">', shared=True)
+
 app_state = {
     'input_folder': './input',
     'output_folder': './output',
