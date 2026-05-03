@@ -1,6 +1,6 @@
 [project]
 name = "zapcapture-ng"
-version = "1.0.0"
+version = "2026.05.01"
 description = "Lightning Strike Detector with Desktop and Web interfaces based on zapcapture"
 readme = "README.md"
 requires-python = ">=3.10"
