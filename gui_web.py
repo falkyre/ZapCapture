@@ -1,4 +1,5 @@
 import sys
+import argparse
 
 from nicegui import ui, events, run, app
 import cv2
@@ -554,28 +555,29 @@ with ui.row().classes('w-full h-screen no-wrap'):
             ui.tab('Help & Guide')
             
         with ui.tab_panels(tabs, value='Live Preview').classes('w-full h-full bg-black p-4') as tabs_panel:
-            with ui.tab_panel('Live Preview').classes('w-full h-full flex flex-col items-center justify-center bg-black gap-2'):
-                video_preview = ui.interactive_image(cross=True, on_mouse=handle_image_click, events=['mousedown', 'mousemove', 'mouseup']).classes('max-w-full max-h-[75%] border border-gray-700 flex-shrink')
-                with ui.column().classes('w-full px-4 gap-1'):
-                    scrubber_slider = ui.slider(min=0, max=100000, value=0, step=1
-                        ).classes('w-full').on_value_change(handle_scrub).on('change', handle_scrub_end)
-                    scrubber_label = ui.label('00:00  /  00:00').classes('text-white text-lg font-bold text-center w-full')
-                with ui.column().classes('w-full px-4 gap-1'):
-                    strike_scan_progress = ui.linear_progress(value=0, show_value=False,
-                        ).classes('w-full').props('visible=False')
-                    strike_list_label = ui.label('Detected Strikes (click to seek):').classes('text-white text-sm font-bold')
-                    strike_list_label.set_visibility(False)
-                    with ui.element('div').classes('w-full').style('max-height: 200px; overflow-y: auto;'):
-                        strike_table = ui.table(
-                            columns=[{'name': 'time', 'label': 'Time', 'field': 'time', 'align': 'left'},
-                                     {'name': 'diff', 'label': 'Diff', 'field': 'diff', 'align': 'right'}],
-                            rows=[],
-                        ).classes('w-full text-sm').props('dense')
-                        strike_table.on('row-click', lambda e: seek_to_strike(e))
-                        strike_table.set_visibility(False)
-                    strike_rescan_btn = ui.button('Rescan for Strikes', on_click=start_strike_scan
-                        ).classes('bg-blue-600')
-                    strike_rescan_btn.set_visibility(False)
+            with ui.tab_panel('Live Preview').classes('p-0 bg-black w-full h-full'):
+                with ui.column().classes('w-full h-full no-wrap justify-start gap-2 overflow-y-auto'):
+                    video_preview = ui.interactive_image(cross=True, on_mouse=handle_image_click, events=['mousedown', 'mousemove', 'mouseup']).classes('max-w-full max-h-[75%] border border-gray-700 flex-shrink')
+                    with ui.column().classes('w-full px-4 gap-1'):
+                        scrubber_slider = ui.slider(min=0, max=100000, value=0, step=1
+                            ).classes('w-full').on_value_change(handle_scrub).on('change', handle_scrub_end)
+                        scrubber_label = ui.label('00:00  /  00:00').classes('text-white text-lg font-bold text-center w-full')
+                    with ui.column().classes('w-full px-4 gap-1'):
+                        strike_scan_progress = ui.linear_progress(value=0, show_value=False,
+                            ).classes('w-full').props('visible=False')
+                        strike_list_label = ui.label('Detected Strikes (click to seek):').classes('text-white text-sm font-bold')
+                        strike_list_label.set_visibility(False)
+                        with ui.element('div').classes('w-full').style('max-height: 200px; overflow-y: auto;'):
+                            strike_table = ui.table(
+                                columns=[{'name': 'time', 'label': 'Time', 'field': 'time', 'align': 'left'},
+                                         {'name': 'diff', 'label': 'Diff', 'field': 'diff', 'align': 'right'}],
+                                rows=[],
+                            ).classes('w-full text-sm').props('dense')
+                            strike_table.on('row-click', lambda e: seek_to_strike(e))
+                            strike_table.set_visibility(False)
+                        strike_rescan_btn = ui.button('Rescan for Strikes', on_click=start_strike_scan
+                            ).classes('bg-blue-600')
+                        strike_rescan_btn.set_visibility(False)
                 
             with ui.tab_panel('Analysis Results').classes('p-0 bg-gray-900 w-full h-full'):
                 with ui.column().classes('w-full h-full no-wrap justify-between'):
@@ -597,8 +599,12 @@ with ui.row().classes('w-full h-screen no-wrap'):
 
 preview_timer = ui.timer(0.033, update_preview, active=False)
 
+parser = argparse.ArgumentParser(description='ZapCapture-NG Web')
+parser.add_argument('--port', type=int, default=8080, help='Port for the web interface (default: 8080)')
+args, _ = parser.parse_known_args()
+
 verbose = parse_verbose_arg()
 setup_logging(verbose=verbose)
-logger.info('ZapCapture-NG Web starting on 0.0.0.0:8080 (verbose=%s)', verbose)
+logger.info('ZapCapture-NG Web starting on 0.0.0.0:%d (verbose=%s)', args.port, verbose)
 
-ui.run(host='0.0.0.0', port=8080, title='ZapCapture-NG Web', reload=False)
+ui.run(host='0.0.0.0', port=args.port, title='ZapCapture-NG Web', reload=False)

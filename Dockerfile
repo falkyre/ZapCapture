@@ -15,4 +15,5 @@ COPY core.py gui_web.py ./
 
 EXPOSE 8080
 
-CMD ["python", "gui_web.py"]
+ENTRYPOINT ["python", "gui_web.py"]
+CMD ["--port", "8080"]
