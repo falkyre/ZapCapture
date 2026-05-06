@@ -1,0 +1,980 @@
+import sys
+import os
+import cv2
+import shutil
+import tempfile
+import numpy as np
+from PySide6.QtCore import Qt, QTimer, QThread, Signal, QRect
+
+from logging_config import get_logger, setup_logging, parse_verbose_arg
+
+logger = get_logger(__name__)
+from PySide6.QtGui import QImage, QPixmap, QMovie, QPainter, QPen, QColor
+from PySide6.QtWidgets import (QApplication, QMainWindow, QLabel, QVBoxLayout,
+                               QWidget, QPushButton, QLineEdit, QHBoxLayout, QFileDialog,
+                               QTabWidget, QScrollArea, QGridLayout, QCheckBox, QComboBox, QMessageBox, QProgressBar, QRadioButton, QButtonGroup, QDoubleSpinBox, QTextBrowser, QListWidget, QListWidgetItem, QSlider, QStackedLayout)
+from core import ZapCore, get_available_fonts, VERSION
+
+class HoverImageLabel(QLabel):
+    def __init__(self, static_pixmap, gif_path, parent=None):
+        super().__init__(parent)
+        self.static_pixmap = static_pixmap
+        self.gif_path = gif_path
+        
+        self.setPixmap(self.static_pixmap)
+        
+        if os.path.exists(self.gif_path):
+            self.movie = QMovie(self.gif_path)
+            self.movie.setParent(self)
+            self.movie.setScaledSize(self.static_pixmap.size())
+        else:
+            self.movie = None
+
+    def enterEvent(self, event):
+        if self.movie is not None:
+            self.setMovie(self.movie)
+            self.movie.jumpToFrame(0)
+            self.movie.start()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        if self.movie is not None:
+            self.movie.stop()
+            self.setPixmap(self.static_pixmap)
+        super().leaveEvent(event)
+
+
+class MaskDrawLabel(QLabel):
+    """Interactive label for drawing a mask rectangle on a video frame."""
+    mask_confirmed = Signal(int, int, int, int)   # x, y, w, h (original frame coords)
+    mask_cancelled = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self._pixmap = None
+        self._start_pt = None
+        self._end_pt = None
+        self._drawing = False
+        self._orig_w = 0
+        self._orig_h = 0
+
+    def set_frame(self, cv2_frame):
+        h, w = cv2_frame.shape[:2]
+        self._orig_w, self._orig_h = w, h
+        rgb = cv2.cvtColor(cv2_frame, cv2.COLOR_BGR2RGB)
+        qimg = QImage(rgb.data, w, h, w * 3, QImage.Format_RGB888)
+        pixmap = QPixmap.fromImage(qimg)
+
+        available_size = self.size()
+        if available_size.width() > 0 and available_size.height() > 0:
+            pixmap = pixmap.scaled(available_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+
+        self._pixmap = pixmap
+        self.setPixmap(self._pixmap)
+        self.updateGeometry()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._drawing = True
+            self._start_pt = event.position().toPoint()
+            self._end_pt = self._start_pt
+
+    def mouseMoveEvent(self, event):
+        if self._drawing:
+            self._end_pt = event.position().toPoint()
+            self.update()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._drawing = False
+            self.update()
+
+    def mouseDoubleClickEvent(self, event):
+        if self._start_pt and self._end_pt:
+            self._emit_mask()
+
+    def contextMenuEvent(self, event):
+        self.mask_cancelled.emit()
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Escape:
+            self.mask_cancelled.emit()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if self._start_pt and self._end_pt:
+            painter = QPainter(self)
+            rect = QRect(min(self._start_pt.x(), self._end_pt.x()),
+                         min(self._start_pt.y(), self._end_pt.y()),
+                         abs(self._end_pt.x() - self._start_pt.x()),
+                         abs(self._end_pt.y() - self._start_pt.y()))
+            painter.fillRect(rect, QColor(255, 0, 0, 80))
+            painter.setPen(QPen(Qt.white, 2, Qt.DashLine))
+            painter.drawRect(rect)
+
+    def _emit_mask(self):
+        if self._pixmap is None:
+            return
+        disp_w = self._pixmap.width()
+        disp_h = self._pixmap.height()
+
+        # The pixmap is centered inside the label due to KeepAspectRatio scaling.
+        # Mouse events report widget-relative coordinates, so we must subtract the
+        # centering offset (letterbox/pillarbox) before mapping to frame coordinates.
+        offset_x = (self.width() - disp_w) // 2
+        offset_y = (self.height() - disp_h) // 2
+
+        sx = self._orig_w / max(disp_w, 1)
+        sy = self._orig_h / max(disp_h, 1)
+
+        # Clamp mouse points to within the pixmap area before scaling
+        def clamp_pt(px, py):
+            px = max(offset_x, min(px, offset_x + disp_w))
+            py = max(offset_y, min(py, offset_y + disp_h))
+            return px - offset_x, py - offset_y
+
+        x1_rel, y1_rel = clamp_pt(self._start_pt.x(), self._start_pt.y())
+        x2_rel, y2_rel = clamp_pt(self._end_pt.x(), self._end_pt.y())
+
+        x = int(min(x1_rel, x2_rel) * sx)
+        y = int(min(y1_rel, y2_rel) * sy)
+        w = int(abs(x2_rel - x1_rel) * sx)
+        h = int(abs(y2_rel - y1_rel) * sy)
+
+        # Clamp final rect to original frame bounds
+        x = max(0, min(x, self._orig_w - 1))
+        y = max(0, min(y, self._orig_h - 1))
+        w = max(0, min(w, self._orig_w - x))
+        h = max(0, min(h, self._orig_h - y))
+
+        if w > 0 and h > 0:
+            self.mask_confirmed.emit(x, y, w, h)
+
+    def clear(self):
+        self._pixmap = None
+        self._start_pt = None
+        self._end_pt = None
+        self._drawing = False
+        self.update()
+
+
+class PreviewGallery(QWidget):
+    def __init__(self, engine, parent=None):
+        super().__init__(parent)
+        self.engine = engine
+        self.temp_dir = ""
+        self.final_out_dir = ""
+        self.selected_files = []
+        
+        self.layout = QVBoxLayout(self)
+        
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll_content = QWidget()
+        self.grid_layout = QGridLayout(self.scroll_content)
+        
+        self.scroll.setWidget(self.scroll_content)
+        self.layout.addWidget(self.scroll)
+        
+        self.btn_layout = QHBoxLayout()
+        self.select_all_btn = QPushButton("Select All")
+        self.select_all_btn.clicked.connect(self.select_all)
+        self.deselect_all_btn = QPushButton("Deselect All")
+        self.deselect_all_btn.clicked.connect(self.deselect_all)
+        self.save_btn = QPushButton("Save Selected")
+        self.save_btn.clicked.connect(self.save_selected)
+        self.cancel_btn = QPushButton("Discard All")
+        self.cancel_btn.clicked.connect(self.clear_gallery)
+        
+
+        
+        self.btn_layout.addWidget(self.select_all_btn)
+        self.btn_layout.addWidget(self.deselect_all_btn)
+        self.btn_layout.addWidget(self.save_btn)
+        self.btn_layout.addWidget(self.cancel_btn)
+        self.layout.addLayout(self.btn_layout)
+        self.checkboxes = []
+        
+
+    def load_images(self, temp_dir, final_out_dir):
+        self.temp_dir = temp_dir
+        self.final_out_dir = final_out_dir
+        
+        # Clear existing layout
+        while self.grid_layout.count():
+            child = self.grid_layout.takeAt(0)
+            if child.widget():
+                child.widget().deleteLater()
+                
+        if not os.path.exists(self.temp_dir):
+            return
+            
+        row = 0
+        col = 0
+        self.checkboxes = []
+        
+        for filename in sorted(os.listdir(self.temp_dir)):
+            if filename.endswith(".png"):
+                filepath = os.path.join(self.temp_dir, filename)
+                gif_filename = filename.replace(".png", ".gif")
+                gif_path = os.path.join(self.temp_dir, gif_filename)
+                
+                item_widget = QWidget()
+                item_layout = QVBoxLayout(item_widget)
+                item_layout.setAlignment(Qt.AlignCenter)
+                
+                pixmap = QPixmap(filepath)
+                pixmap = pixmap.scaled(200, 200, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                lbl = HoverImageLabel(pixmap, gif_path)
+                
+                cb = QCheckBox(filename)
+                cb.setChecked(True)
+                
+                self.checkboxes.append((cb, filepath))
+                
+                item_layout.addWidget(lbl)
+                item_layout.addWidget(cb)
+                
+                self.grid_layout.addWidget(item_widget, row, col)
+                
+                col += 1
+                if col > 3:
+                    col = 0
+                    row += 1
+
+    def select_all(self):
+        for cb, _ in self.checkboxes:
+            cb.setChecked(True)
+
+    def deselect_all(self):
+        for cb, _ in self.checkboxes:
+            cb.setChecked(False)
+
+    def save_selected(self):
+        out_frames_dir = os.path.join(self.final_out_dir, "frames")
+        out_gifs_dir = os.path.join(self.final_out_dir, "gifs")
+        out_mp4s_dir = os.path.join(self.final_out_dir, "mp4s")
+        
+        os.makedirs(out_frames_dir, exist_ok=True)
+        os.makedirs(out_gifs_dir, exist_ok=True)
+        os.makedirs(out_mp4s_dir, exist_ok=True)
+
+        copied_mp4s = set()
+            
+        for cb, filepath in self.checkboxes:
+            if cb.isChecked():
+                filename = os.path.basename(filepath)
+                shutil.copy2(filepath, os.path.join(out_frames_dir, filename))
+                
+                gif_filename = filename.replace(".png", ".gif")
+                gif_path = os.path.join(self.temp_dir, gif_filename)
+                if os.path.exists(gif_path):
+                    shutil.copy2(gif_path, os.path.join(out_gifs_dir, gif_filename))
+
+                # Use the engine's png_to_mp4 map for exact match
+                mp4_src = self.engine.png_to_mp4.get(filepath)
+                if mp4_src and os.path.exists(mp4_src) and mp4_src not in copied_mp4s:
+                    shutil.copy2(mp4_src, os.path.join(out_mp4s_dir, os.path.basename(mp4_src)))
+                    copied_mp4s.add(mp4_src)
+        
+        self.clear_gallery()
+
+    def clear_gallery(self):
+        while self.grid_layout.count():
+            child = self.grid_layout.takeAt(0)
+            if child.widget():
+                child.widget().deleteLater()
+        self.checkboxes = []
+        try:
+            if self.temp_dir and os.path.exists(self.temp_dir):
+                shutil.rmtree(self.temp_dir)
+        except Exception as e:
+            logger.error('Failed to clean up temp dir %s: %s', self.temp_dir, e)
+            logger.debug('Temp dir cleanup traceback:', exc_info=True)
+
+class AnalysisThread(QThread):
+    finished = Signal(str, str, str)
+
+    def __init__(self, engine, in_dir, out_dir):
+        super().__init__()
+        self.engine = engine
+        self.in_dir = in_dir
+        self.out_dir = out_dir
+
+    def run(self):
+        temp_folder = tempfile.mkdtemp(prefix="zapcapture_")
+        result = self.engine.run_analysis(self.in_dir, temp_folder)
+        self.finished.emit(result, temp_folder, self.out_dir)
+
+
+class StrikeScanThread(QThread):
+    progress = Signal(int)
+    finished = Signal(list)
+
+    def __init__(self, engine, video_path):
+        super().__init__()
+        self.engine = engine
+        self.video_path = video_path
+
+    def run(self):
+        cap = cv2.VideoCapture(self.video_path)
+        if not cap.isOpened():
+            self.finished.emit([])
+            return
+        nframes = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        cap.release()
+
+        strikes = []
+        cap2 = cv2.VideoCapture(self.video_path)
+        ret, frame0 = cap2.read()
+        if not ret:
+            cap2.release()
+            self.finished.emit([])
+            return
+        fps = cap2.get(cv2.CAP_PROP_FPS) or 30
+        for i in range(1, nframes):
+            ret, frame1 = cap2.read()
+            if not ret:
+                break
+            diff = self.engine._count_diff(frame0, frame1)
+            if diff > self.engine.threshold:
+                strikes.append({
+                    "frame": i,
+                    "diff": int(diff),
+                    "timestamp": i / fps
+                })
+            frame0 = frame1
+            if i % 500 == 0:
+                self.progress.emit(int((i / nframes) * 100))
+        cap2.release()
+        self.finished.emit(strikes)
+
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.engine = ZapCore()
+        self.setWindowTitle("ZapCapture-NG Desktop")
+        self.resize(1000, 700)
+        
+        self.input_dir = "./input"
+        self.output_dir = "./output"
+        
+        main_layout = QHBoxLayout()
+        controls_layout = QVBoxLayout()
+        
+        self.btn_in = QPushButton("Select Input Dir")
+        self.lbl_in_dir = QLabel(self.input_dir)
+        self.lbl_in_dir.setWordWrap(True)
+        self.lbl_in_dir.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self.btn_in.clicked.connect(self.select_input)
+        self.btn_out = QPushButton("Select Output Dir")
+        self.lbl_out_dir = QLabel(self.output_dir)
+        self.lbl_out_dir.setWordWrap(True)
+        self.lbl_out_dir.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self.btn_out.clicked.connect(self.select_output)
+        
+        self.outputFilenameLabel = QLabel("Output Filenames:")
+        self.outputFrameNumButton = QRadioButton("Frame Number (e.g. VID_0123.png)")
+        self.outputTimestampButton = QRadioButton("Timestamp (e.g. VID_0-12s.png)")
+        if self.engine.output_format == 'timestamp':
+            self.outputTimestampButton.setChecked(True)
+        else:
+            self.outputFrameNumButton.setChecked(True)
+        self.btn_group_output = QButtonGroup(self)
+        self.btn_group_output.addButton(self.outputFrameNumButton)
+        self.btn_group_output.addButton(self.outputTimestampButton)
+        self.outputFrameNumButton.toggled.connect(self.update_output_format)
+        self.outputTimestampButton.toggled.connect(self.update_output_format)
+        
+        self.btn_set_mask = QPushButton("Select Area to Ignore (Mask)")
+        self.btn_set_mask.clicked.connect(self.define_mask)
+        self.btn_clear_mask = QPushButton("Clear Mask")
+        self.btn_clear_mask.clicked.connect(self.clear_mask)
+        
+        self.combo_mode = QComboBox()
+        self.combo_mode.addItem("Standard (Intensity Difference)", "standard")
+        self.combo_mode.addItem("Canny Edge Density", "canny")
+        self.combo_mode.addItem("Hybrid (Intensity + Edge Count)", "hybrid")
+        self.combo_mode.currentIndexChanged.connect(self.update_mode)
+        
+        self.btn_calc_thresh = QPushButton("Calculate Suggested Threshold")
+        self.btn_calc_thresh.clicked.connect(self.calculate_suggested_threshold)
+        
+        self.watermark_label = QLabel("Watermark:")
+        self.watermark_label.setToolTip("Watermark text is burned into the frames during analysis. Must be set before running analysis.")
+        self.watermark_input = QLineEdit()
+        self.watermark_input.setPlaceholderText("Enter watermark text...")
+        self.watermark_input.textChanged.connect(self.update_watermark)
+        
+        self.font_preview_label = QLabel()
+        self.font_preview_label.setFixedHeight(60)
+        self.font_preview_label.setAlignment(Qt.AlignCenter)
+        self.font_preview_label.setStyleSheet("background-color: #222; border: 1px solid #555;")
+        
+        self.watermark_font_combo = QComboBox()
+        available_fonts = get_available_fonts()
+        for font_file, font_name in available_fonts.items():
+            self.watermark_font_combo.addItem(font_name, font_file)
+            
+        default_index = self.watermark_font_combo.findData(self.engine.watermark_font)
+        if default_index >= 0:
+            self.watermark_font_combo.setCurrentIndex(default_index)
+            
+        self.watermark_font_combo.currentIndexChanged.connect(self.update_watermark_font)
+        
+        self.watermark_size_spin = QDoubleSpinBox()
+        self.watermark_size_spin.setRange(0.1, 5.0)
+        self.watermark_size_spin.setSingleStep(0.1)
+        self.watermark_size_spin.setValue(1.0)
+        self.watermark_size_spin.valueChanged.connect(self.update_watermark_size)
+        
+        self.watermark_layout = QHBoxLayout()
+        self.watermark_layout.addWidget(QLabel("Font:"))
+        self.watermark_layout.addWidget(self.watermark_font_combo)
+        self.watermark_layout.addWidget(QLabel("Size:"))
+        self.watermark_layout.addWidget(self.watermark_size_spin)
+        
+        self.thresh_input = QLineEdit(str(self.engine.threshold))
+        self.thresh_input.textChanged.connect(self.update_thresh)
+        
+        self.btn_preview = QPushButton("Start Preview")
+        self.btn_preview.clicked.connect(self.toggle_preview)
+        
+        self.btn_analyze = QPushButton("Run Analysis")
+        self.btn_analyze.clicked.connect(self.start_analysis)
+        
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setAlignment(Qt.AlignHCenter | Qt.AlignVCenter)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFormat("%p%")
+        self.progress_bar.setStyleSheet("""
+            QProgressBar {
+                border: 2px solid #555;
+                background-color: #111;
+                text-align: center;
+                color: #ffffff;
+                font-weight: bold;
+                font-size: 11px;
+            }
+            QProgressBar::chunk {
+                background-color: #22c55e;
+                width: 15px;
+                margin: 1px;
+            }
+        """)
+        
+        self.export_format_combo = QComboBox()
+        self.export_format_combo.addItem("GIF only", "gif")
+        self.export_format_combo.addItem("MP4 only", "mp4")
+        self.export_format_combo.addItem("GIF + MP4", "both")
+        self.export_format_combo.currentIndexChanged.connect(
+            lambda: setattr(self.engine, 'export_format', self.export_format_combo.currentData()))
+
+        self.crop_ratio_combo = QComboBox()
+        self.crop_ratio_combo.addItem("Original", "None")
+        self.crop_ratio_combo.addItem("Square (1:1)", "1:1")
+        self.crop_ratio_combo.addItem("Portrait (9:16)", "9:16")
+        self.crop_ratio_combo.currentIndexChanged.connect(
+            lambda: setattr(self.engine, 'crop_aspect_ratio', self.crop_ratio_combo.currentData()))
+
+        self.queue_list_widget = QListWidget()
+        self.queue_list_widget.setFixedHeight(120)
+        self.queue_list_widget.setStyleSheet("background-color: #111; color: #ccc; font-size: 11px;")
+
+        self.btn_skip = QPushButton("⏭ Skip Current File")
+        self.btn_skip.clicked.connect(lambda: setattr(self.engine, 'skip_current', True))
+        self.btn_skip.setEnabled(False)
+        self.btn_cancel = QPushButton("⏹ Cancel All")
+        self.btn_cancel.clicked.connect(lambda: setattr(self.engine, 'cancel_analysis', True))
+        self.btn_cancel.setEnabled(False)
+        
+        controls_layout.addWidget(self.btn_in)
+        controls_layout.addWidget(self.lbl_in_dir)
+        controls_layout.addWidget(self.btn_out)
+        controls_layout.addWidget(self.lbl_out_dir)
+        controls_layout.addWidget(self.outputFilenameLabel)
+        controls_layout.addWidget(self.outputFrameNumButton)
+        controls_layout.addWidget(self.outputTimestampButton)
+        controls_layout.addWidget(self.btn_set_mask)
+        controls_layout.addWidget(self.btn_clear_mask)
+        controls_layout.addWidget(QLabel("Detection Mode:"))
+        controls_layout.addWidget(self.combo_mode)
+        controls_layout.addWidget(self.btn_calc_thresh)
+        controls_layout.addWidget(QLabel("Threshold:"))
+        controls_layout.addWidget(self.thresh_input)
+        controls_layout.addWidget(self.btn_preview)
+        controls_layout.addWidget(self.watermark_label)
+        controls_layout.addWidget(self.font_preview_label)
+        controls_layout.addWidget(self.watermark_input)
+        controls_layout.addLayout(self.watermark_layout)
+        controls_layout.addWidget(QLabel("Export Format:"))
+        controls_layout.addWidget(self.export_format_combo)
+        controls_layout.addWidget(QLabel("Crop Aspect Ratio:"))
+        controls_layout.addWidget(self.crop_ratio_combo)
+        controls_layout.addWidget(self.btn_analyze)
+        controls_layout.addWidget(self.progress_bar)
+        controls_layout.addWidget(QLabel("Processing Queue:"))
+        controls_layout.addWidget(self.queue_list_widget)
+        queue_controls = QHBoxLayout()
+        queue_controls.addWidget(self.btn_skip)
+        queue_controls.addWidget(self.btn_cancel)
+        controls_layout.addLayout(queue_controls)
+        controls_layout.addStretch()
+        
+        self.tabs = QTabWidget()
+        
+        # Live Preview Tab
+        self.preview_widget = QWidget()
+        preview_layout = QVBoxLayout(self.preview_widget)
+
+        # Stacked layout for video display (video_label and mask_draw_label share same space)
+        self.preview_stacked = QStackedLayout()
+        self.video_label = QLabel("Preview Area")
+        self.video_label.setAlignment(Qt.AlignCenter)
+        self.video_label.setStyleSheet("background-color: black;")
+        self.preview_stacked.addWidget(self.video_label)
+
+        self.mask_draw_label = MaskDrawLabel()
+        self.mask_draw_label.mask_confirmed.connect(self.on_mask_confirmed)
+        self.preview_stacked.addWidget(self.mask_draw_label)
+
+        preview_container = QWidget()
+        preview_container.setLayout(self.preview_stacked)
+        preview_layout.addWidget(preview_container, 1)
+
+        self.mask_status_label = QLabel("")
+        self.mask_status_label.setAlignment(Qt.AlignCenter)
+        self.mask_status_label.setStyleSheet("color: #ffcc00; font-size: 12px; padding: 8px; background-color: #1a1a1a; border: 1px solid #333;")
+        self.mask_status_label.setWordWrap(True)
+        preview_layout.addWidget(self.mask_status_label)
+        
+        self.scrubber = QSlider(Qt.Horizontal)
+        self.scrubber.setRange(0, 1000)
+        self.scrubber.setEnabled(False)
+        self.scrubber.sliderMoved.connect(self.handle_scrub)
+        self.scrubber.sliderPressed.connect(self.handle_scrub_start)
+        self.scrubber.sliderReleased.connect(self.handle_scrub_end)
+        
+        self.timecode_label = QLabel("00:00 / 00:00")
+        self.timecode_label.setAlignment(Qt.AlignCenter)
+        self.timecode_label.setStyleSheet("color: #ffffff; font-size: 14px; font-weight: bold;")
+        
+        preview_layout.addWidget(self.scrubber)
+        preview_layout.addWidget(self.timecode_label)
+
+        self.strike_scan_progress = QProgressBar()
+        self.strike_scan_progress.setAlignment(Qt.AlignHCenter | Qt.AlignVCenter)
+        self.strike_scan_progress.setValue(0)
+        self.strike_scan_progress.setFixedHeight(8)
+        self.strike_scan_progress.setStyleSheet("""
+            QProgressBar {
+                border: 1px solid #444;
+                background-color: #111;
+                text-align: center;
+                color: #aaa;
+                font-size: 10px;
+            }
+            QProgressBar::chunk {
+                background-color: #3b82f6;
+                width: 15px;
+                margin: 1px;
+            }
+        """)
+        self.strike_scan_progress.setVisible(False)
+        preview_layout.addWidget(self.strike_scan_progress)
+
+        self.strike_list_label = QLabel("Detected Strikes (click to seek):")
+        self.strike_list_label.setStyleSheet("color: #ccc; font-size: 12px; font-weight: bold;")
+        self.strike_list_label.setVisible(False)
+        preview_layout.addWidget(self.strike_list_label)
+
+        self.strike_list_widget = QListWidget()
+        self.strike_list_widget.setFixedHeight(150)
+        self.strike_list_widget.setStyleSheet("background-color: #111; color: #ccc; font-size: 11px;")
+        self.strike_list_widget.itemClicked.connect(self.on_strike_list_item_clicked)
+        self.strike_list_widget.setVisible(False)
+        preview_layout.addWidget(self.strike_list_widget)
+
+        self.strike_rescan_btn = QPushButton("Rescan for Strikes")
+        self.strike_rescan_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #3b82f6; color: white; font-weight: bold;
+                padding: 4px 12px; border-radius: 4px; font-size: 11px;
+            }
+            QPushButton:hover { background-color: #2563eb; }
+        """)
+        self.strike_rescan_btn.clicked.connect(self.on_rescan_strikes)
+        self.strike_rescan_btn.setVisible(False)
+        preview_layout.addWidget(self.strike_rescan_btn)
+
+        self.btn_confirm_mask = QPushButton("✓ Confirm Mask")
+        self.btn_confirm_mask.setVisible(False)
+        self.btn_confirm_mask.clicked.connect(self.confirm_mask)
+        self.btn_confirm_mask.setStyleSheet("""
+            QPushButton {
+                background-color: #22c55e; color: white; font-weight: bold;
+                padding: 6px 16px; border-radius: 4px; font-size: 12px;
+            }
+            QPushButton:hover { background-color: #16a34a; }
+        """)
+        preview_layout.addWidget(self.btn_confirm_mask)
+
+        self.gallery_tab = PreviewGallery(self.engine)
+        
+        self.tabs.addTab(self.preview_widget, "Live Preview")
+        self.tabs.addTab(self.gallery_tab, "Analysis Results")
+        
+        self.help_tab = QWidget()
+        help_layout = QVBoxLayout(self.help_tab)
+        self.help_browser = QTextBrowser()
+        self.help_browser.setOpenExternalLinks(True)
+        guide_path = os.path.join(os.path.dirname(__file__), 'assets', 'USER_GUIDE.md')
+        if os.path.exists(guide_path):
+            with open(guide_path, 'r', encoding='utf-8') as f:
+                self.help_browser.setMarkdown(f.read())
+        else:
+            self.help_browser.setMarkdown("# Help Guide\n\nUser guide not found.")
+        help_layout.addWidget(self.help_browser)
+        self.tabs.addTab(self.help_tab, "Help & Guide")
+        
+        main_layout.addLayout(controls_layout, 1)
+        main_layout.addWidget(self.tabs, 2)
+        
+        widget = QWidget()
+        widget.setLayout(main_layout)
+        self.setCentralWidget(widget)
+        
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.update_preview)
+        self.is_previewing = False
+        self.scrubbing = False
+        self.is_mask_mode = False
+
+        self.progress_timer = QTimer()
+        self.progress_timer.timeout.connect(self.update_progress)
+        
+        self.update_font_preview()
+        
+    def select_input(self):
+        self.input_dir = QFileDialog.getExistingDirectory(self, "Select Input")
+        self.lbl_in_dir.setText(self.input_dir)
+        
+    def select_output(self):
+        self.output_dir = QFileDialog.getExistingDirectory(self, "Select Output")
+        self.lbl_out_dir.setText(self.output_dir)
+
+    def update_watermark(self, text):
+        self.engine.watermark_text = text
+        self.update_font_preview()
+
+    def update_watermark_font(self):
+        self.engine.watermark_font = self.watermark_font_combo.currentData()
+        self.update_font_preview()
+        
+    def update_watermark_size(self, val):
+        self.engine.watermark_size = float(val)
+        self.update_font_preview()
+        
+    def update_font_preview(self):
+        frame = self.engine.generate_font_preview()
+        h, w, ch = frame.shape
+        bytes_per_line = ch * w
+        qimg = QImage(frame.data, w, h, bytes_per_line, QImage.Format_RGB888).rgbSwapped()
+        self.font_preview_label.setPixmap(QPixmap.fromImage(qimg))
+
+    def update_output_format(self):
+        if self.outputTimestampButton.isChecked():
+            self.engine.output_format = 'timestamp'
+        else:
+            self.engine.output_format = 'frame'
+
+    def update_thresh(self, text):
+        if text.isdigit():
+            self.engine.threshold = int(text)
+
+    def update_mode(self):
+        self.engine.detection_mode = self.combo_mode.currentData()
+
+    def define_mask(self):
+        if not os.path.isdir(self.input_dir):
+            QMessageBox.warning(self, "Error", "Please select a valid input folder first.")
+            return
+
+        first_video = None
+        for f in os.listdir(self.input_dir):
+            if f.lower().endswith(('.mp4', '.avi', '.mov', '.mkv', '.wmv')):
+                first_video = os.path.join(self.input_dir, f)
+                break
+
+        if not first_video:
+            QMessageBox.warning(self, "Error", "No video files found in the selected input folder.")
+            return
+
+        cap = cv2.VideoCapture(first_video)
+        ret, frame = cap.read()
+        cap.release()
+
+        if not ret:
+            QMessageBox.warning(self, "Error", "Could not read the first video to define a mask.")
+            return
+
+        self.is_mask_mode = True
+        self.mask_status_label.setText("Click and drag to draw mask area. Click the 'Confirm Mask' button below, or press Escape/right-click to cancel.")
+
+        self.mask_draw_label.set_frame(frame)
+        self.preview_stacked.setCurrentIndex(1)
+        self.btn_confirm_mask.setVisible(True)
+
+    def confirm_mask(self):
+        if self.mask_draw_label._start_pt and self.mask_draw_label._end_pt:
+            self.mask_draw_label._emit_mask()
+
+    def on_mask_confirmed(self, x, y, w, h):
+        self.engine.set_mask(x, y, w, h)
+        self.btn_set_mask.setText("Area to Ignore: Custom Mask Applied")
+        logger.info('Mask set at x=%d, y=%d, w=%d, h=%d', x, y, w, h)
+        self.exit_mask_mode()
+
+    def exit_mask_mode(self):
+        self.is_mask_mode = False
+        self.preview_stacked.setCurrentIndex(0)
+        self.mask_draw_label.clear()
+        self.mask_status_label.setText("")
+        self.btn_confirm_mask.setVisible(False)
+
+    def start_strike_scan(self, video_path):
+        self.strike_list_widget.clear()
+        self.strike_list_widget.setVisible(True)
+        self.strike_list_label.setVisible(True)
+        self.strike_scan_progress.setValue(0)
+        self.strike_scan_progress.setVisible(True)
+        self.strike_rescan_btn.setVisible(False)
+        self.strike_scan_thread = StrikeScanThread(self.engine, video_path)
+        self.strike_scan_thread.progress.connect(self.on_strike_scan_progress)
+        self.strike_scan_thread.finished.connect(self.on_strike_scan_done)
+        self.strike_scan_thread.start()
+
+    def on_strike_scan_progress(self, percent):
+        self.strike_scan_progress.setValue(percent)
+
+    def on_strike_scan_done(self, strike_list):
+        self.strike_scan_progress.setVisible(False)
+        self.strike_rescan_btn.setVisible(True)
+        for strike in strike_list:
+            ts = strike["timestamp"]
+            mins = int(ts // 60)
+            secs = int(ts % 60)
+            label = f"{mins:02d}:{secs:02d}  Diff: {strike['diff']}"
+            item = QListWidgetItem(label)
+            item.setData(Qt.UserRole, strike["frame"])
+            self.strike_list_widget.addItem(item)
+        logger.info('Strike scan done: %d strikes found', len(strike_list))
+
+    def on_strike_list_item_clicked(self, item):
+        frame_num = item.data(Qt.UserRole)
+        if frame_num is not None:
+            self.handle_scrub(frame_num)
+
+    def on_rescan_strikes(self):
+        if self.engine._current_video_path:
+            self.start_strike_scan(self.engine._current_video_path)
+
+    def keyPressEvent(self, event):
+        if self.is_mask_mode and event.key() == Qt.Key_Escape:
+            self.engine.clear_mask()
+            self.btn_set_mask.setText("Select Area to Ignore (Mask)")
+            logger.info('Mask selection cancelled')
+            self.exit_mask_mode()
+        else:
+            super().keyPressEvent(event)
+
+    def clear_mask(self):
+        self.engine.clear_mask()
+        self.btn_set_mask.setText("Select Area to Ignore (Mask)")
+
+    def calculate_suggested_threshold(self):
+        if not os.path.isdir(self.input_dir):
+            QMessageBox.warning(self, "Error", "Please select a valid input folder first.")
+            return
+
+        first_video = None
+        for f in os.listdir(self.input_dir):
+            if f.lower().endswith(('.mp4', '.avi', '.mov', '.mkv', '.wmv')):
+                first_video = os.path.join(self.input_dir, f)
+                break
+
+        if not first_video:
+            QMessageBox.warning(self, "Error", "No video files found in the selected input folder.")
+            return
+
+        self.btn_calc_thresh.setText("Calculating... Please wait")
+        self.btn_calc_thresh.setEnabled(False)
+        QApplication.processEvents()
+
+        cap = cv2.VideoCapture(first_video)
+        ret, frame0 = cap.read()
+        if not ret:
+            QMessageBox.warning(self, "Error", "Could not read the first video.")
+            cap.release()
+            self.btn_calc_thresh.setText("Calculate Suggested Threshold")
+            self.btn_calc_thresh.setEnabled(True)
+            return
+
+        diffs = []
+        for i in range(1500):
+            ret, frame1 = cap.read()
+            if not ret: break
+            diffs.append(self.engine._count_diff(frame0, frame1))
+            frame0 = frame1
+            if i % 50 == 0: QApplication.processEvents()
+        cap.release()
+
+        if diffs:
+            diffs_arr = np.array(diffs)
+            suggested = int(np.percentile(diffs_arr, 99))
+            suggested = max(suggested, 1000)
+            self.thresh_input.setText(str(suggested))
+            self.engine.threshold = suggested
+        
+        self.btn_calc_thresh.setText("Calculate Suggested Threshold")
+        self.btn_calc_thresh.setEnabled(True)
+
+    def format_timecode(self, frame, fps):
+        total_secs = frame / max(fps, 1)
+        mins = int(total_secs // 60)
+        secs = int(total_secs % 60)
+        return f'{mins:02d}:{secs:02d}'
+
+    def handle_scrub_start(self):
+        self.scrubbing = True
+
+    def handle_scrub(self, val):
+        frame = self.engine.seek_preview(val)
+        if frame is not None:
+            self.display_frame(frame)
+            _, total, fps = self.engine.get_preview_info()
+            self.timecode_label.setText(f"{self.format_timecode(val, fps)} / {self.format_timecode(total, fps)}")
+
+    def handle_scrub_end(self):
+        self.scrubbing = False
+
+    def toggle_preview(self):
+        if self.is_previewing:
+            self.timer.stop()
+            self.engine.stop_preview()
+            self.btn_preview.setText("Start Preview")
+            self.is_previewing = False
+            self.video_label.clear()
+            self.scrubber.setEnabled(False)
+            self.timecode_label.setText("00:00 / 00:00")
+            self.strike_list_widget.clear()
+            self.strike_list_widget.setVisible(False)
+            self.strike_list_label.setVisible(False)
+            self.strike_scan_progress.setVisible(False)
+            self.strike_rescan_btn.setVisible(False)
+        else:
+            files = [f for f in os.listdir(self.input_dir) if f.lower().endswith(('.mp4', '.avi', '.mov', '.mkv', '.wmv'))]
+            if files:
+                video_path = os.path.join(self.input_dir, files[0])
+                if self.engine.start_preview(video_path):
+                    self.engine._current_video_path = video_path
+                    pos, total, fps = self.engine.get_preview_info()
+                    self.scrubber.setRange(0, total)
+                    self.scrubber.setValue(pos)
+                    self.scrubber.setEnabled(True)
+                    self.timecode_label.setText(f"00:00 / {self.format_timecode(total, fps)}")
+                    self.timer.start(30)
+                    self.btn_preview.setText("Stop Preview")
+                    self.is_previewing = True
+                    self.start_strike_scan(video_path)
+
+    def update_preview(self):
+        if self.scrubbing:
+            return
+        frame = self.engine.get_annotated_preview_frame()
+        if frame is not None:
+            self.display_frame(frame)
+            pos, total, fps = self.engine.get_preview_info()
+            if total > 0:
+                current_frame = max(0, pos - 1)
+                self.scrubber.setValue(current_frame)
+                self.timecode_label.setText(f"{self.format_timecode(current_frame, fps)} / {self.format_timecode(total, fps)}")
+
+    def display_frame(self, frame):
+        h, w, ch = frame.shape
+        bytes_per_line = ch * w
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        qt_img = QImage(frame_rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
+        pixmap = QPixmap.fromImage(qt_img).scaled(self.video_label.size(), Qt.KeepAspectRatio)
+        self.video_label.setPixmap(pixmap)
+
+    STATUS_ICONS = {'pending': '⏳', 'processing': '▶️', 'done': '✅', 'skipped': '⏭️'}
+
+    def update_progress(self):
+        self.progress_bar.setValue(int(self.engine.progress * 100))
+        for i in range(self.queue_list_widget.count()):
+            item = self.queue_list_widget.item(i)
+            fname = item.text().split(' ', 1)[-1]  # Strip icon prefix
+            status = self.engine.queue_status.get(fname, 'pending')
+            icon = self.STATUS_ICONS.get(status, '⏳')
+            item.setText(f'{icon} {fname}')
+
+    def start_analysis(self):
+        self.btn_analyze.setEnabled(False)
+        self.btn_skip.setEnabled(True)
+        self.btn_cancel.setEnabled(True)
+        self.progress_bar.setValue(0)
+        self.progress_timer.start(100)
+        
+        # Populate queue list
+        self.queue_list_widget.clear()
+        files = sorted([f for f in os.listdir(self.input_dir) if f.lower().endswith(('.mp4', '.avi', '.mov', '.mkv'))])
+        for f in files:
+            self.queue_list_widget.addItem(f'⏳ {f}')
+        
+        self.thread = AnalysisThread(self.engine, self.input_dir, self.output_dir)
+        self.thread.finished.connect(self.analysis_done)
+        self.thread.start()
+
+    def analysis_done(self, result, temp_folder, actual_out_dir):
+        self.progress_timer.stop()
+        self.progress_bar.setValue(100)
+        self.btn_analyze.setEnabled(True)
+        self.btn_skip.setEnabled(False)
+        self.btn_cancel.setEnabled(False)
+        # Final queue status refresh
+        for i in range(self.queue_list_widget.count()):
+            item = self.queue_list_widget.item(i)
+            fname = item.text().split(' ', 1)[-1]
+            status = self.engine.queue_status.get(fname, 'pending')
+            icon = self.STATUS_ICONS.get(status, '⏳')
+            item.setText(f'{icon} {fname}')
+        logger.info('Analysis complete: %s', result)
+        
+        if not os.path.exists(actual_out_dir):
+            os.makedirs(actual_out_dir)
+            
+        for f in os.listdir(temp_folder):
+            if f.endswith('.csv'):
+                shutil.copy2(os.path.join(temp_folder, f), actual_out_dir)
+                
+        self.gallery_tab.load_images(temp_folder, actual_out_dir)
+        self.tabs.setCurrentWidget(self.gallery_tab)
+
+if __name__ == "__main__":
+    if "--version" in sys.argv or "-V" in sys.argv:
+        print(f'ZapCapture-NG Desktop {VERSION}')
+        sys.exit(0)
+    verbose = parse_verbose_arg()
+    setup_logging(verbose=verbose)
+    logger.info('ZapCapture-NG Desktop starting (verbose=%s)', verbose)
+
+    app = QApplication(sys.argv)
+    # Set the internal Qt application name
+    app.setApplicationName("ZapCapture-NG")
+    
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec())
