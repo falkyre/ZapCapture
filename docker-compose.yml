@@ -1,0 +1,8 @@
+services:
+  zapcapture-ng-web:
+    build: .
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./input:/app/input
+      - ./output:/app/output
