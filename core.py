@@ -9,6 +9,8 @@ from PIL import Image, ImageDraw, ImageFont
 
 from logging_config import get_logger, FileError, VideoError
 
+VERSION = "2026.05.01"
+
 logger = get_logger(__name__)
 
 def get_available_fonts():

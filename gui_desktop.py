@@ -13,7 +13,7 @@ from PySide6.QtGui import QImage, QPixmap, QMovie, QPainter, QPen, QColor
 from PySide6.QtWidgets import (QApplication, QMainWindow, QLabel, QVBoxLayout,
                                QWidget, QPushButton, QLineEdit, QHBoxLayout, QFileDialog,
                                QTabWidget, QScrollArea, QGridLayout, QCheckBox, QComboBox, QMessageBox, QProgressBar, QRadioButton, QButtonGroup, QDoubleSpinBox, QTextBrowser, QListWidget, QListWidgetItem, QSlider, QStackedLayout)
-from core import ZapCore, get_available_fonts
+from core import ZapCore, get_available_fonts, VERSION
 
 class HoverImageLabel(QLabel):
     def __init__(self, static_pixmap, gif_path, parent=None):
@@ -964,11 +964,17 @@ class MainWindow(QMainWindow):
         self.tabs.setCurrentWidget(self.gallery_tab)
 
 if __name__ == "__main__":
+    if "--version" in sys.argv or "-V" in sys.argv:
+        print(f'ZapCapture-NG Desktop {VERSION}')
+        sys.exit(0)
     verbose = parse_verbose_arg()
     setup_logging(verbose=verbose)
     logger.info('ZapCapture-NG Desktop starting (verbose=%s)', verbose)
 
     app = QApplication(sys.argv)
+    # Set the internal Qt application name
+    app.setApplicationName("ZapCapture-NG")
+    
     window = MainWindow()
     window.show()
     sys.exit(app.exec())

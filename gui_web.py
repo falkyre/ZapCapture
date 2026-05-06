@@ -11,7 +11,7 @@ import numpy as np
 import time
 
 from logging_config import get_logger, setup_logging, parse_verbose_arg
-from core import ZapCore, get_available_fonts
+from core import ZapCore, get_available_fonts, VERSION
 
 logger = get_logger(__name__)
 
@@ -601,6 +601,7 @@ preview_timer = ui.timer(0.033, update_preview, active=False)
 
 parser = argparse.ArgumentParser(description='ZapCapture-NG Web')
 parser.add_argument('--port', type=int, default=8080, help='Port for the web interface (default: 8080)')
+parser.add_argument('--version', action='version', version=f'ZapCapture-NG Web {VERSION}')
 args, _ = parser.parse_known_args()
 
 verbose = parse_verbose_arg()
